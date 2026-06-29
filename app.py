@@ -11,7 +11,7 @@ import io
 import statistics
 
 st.set_page_config(
-    page_title="Aviation Lessee Credit Analysis",
+    page_title="Aviation Finance Dashboard",
     page_icon="\u2708",
     layout="wide",
 )
@@ -414,7 +414,7 @@ if data:
 # ----------------------------------------------------------------------------
 # Header
 # ----------------------------------------------------------------------------
-st.title("Aviation Lessee Credit Analysis Dashboard")
+st.title("Aviation Finance Dashboard")
 st.caption("Aircraft Lessor Credit Tool | Data: SEC EDGAR XBRL 10-K")
 
 if not data:
@@ -529,7 +529,7 @@ def build_excel():
     ws4 = wb.create_sheet("Methodology")
     ws4.column_dimensions["A"].width = 110
     lines = [
-        "AVIATION LESSEE CREDIT ANALYSIS \u2014 METHODOLOGY",
+        "AVIATION FINANCE DASHBOARD \u2014 METHODOLOGY",
         "",
         "DATA SOURCE",
         "All figures sourced from SEC EDGAR XBRL companyfacts (10-K filings).",
@@ -601,7 +601,338 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(["Credit Summary", "Trends", "Peer Ranking", "Raw Data"])
+# ----------------------------------------------------------------------------
+# Financial Statements engine
+# ----------------------------------------------------------------------------
+# Row spec tuple: (label, concepts|None, kind, style, neg, direction, calc_key)
+#   style:     line / sub / total / eps
+#   neg:       True -> display as -abs(value)
+#   direction: "up" (higher better), "down" (higher worse), None (neutral)
+#   calc_key:  None for pulled rows; a key handled by the calc dispatcher otherwise
+# NOTE: Many airline line items (fuel, maintenance, air-traffic liability, etc.)
+# are reported as company extension tags rather than standard us-gaap concepts,
+# so those rows will frequently be empty and are hidden when all years are None.
+
+INCOME_SPEC = [
+    ("Total Revenue", ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"], DURATION, "line", False, "up", None),
+    ("Cost of Revenue", ["CostOfRevenue", "CostOfGoodsAndServicesSold"], DURATION, "line", True, "down", None),
+    ("Gross Profit", None, DURATION, "sub", False, "up", "gross_profit"),
+    ("Salaries and Benefits", ["LaborAndRelatedExpense", "EmployeeBenefitsAndShareBasedCompensation"], DURATION, "line", False, "down", None),
+    ("Aircraft Fuel", ["AirlineFuelCosts", "FuelCostsAirline"], DURATION, "line", False, "down", None),
+    ("Depreciation and Amortization", ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization"], DURATION, "line", False, "down", None),
+    ("Maintenance", ["AirlineCapacityPurchaseArrangements", "MaintenanceCostsCivil", "AircraftMaintenanceMaterialsAndRepairs"], DURATION, "line", False, "down", None),
+    ("Other Operating Expenses", ["OtherOperatingIncomeExpenseNet", "OtherCostAndExpenseOperating"], DURATION, "line", False, "down", None),
+    ("Total Operating Expenses", None, DURATION, "sub", False, "down", "total_opex"),
+    ("Operating Income (EBIT)", ["OperatingIncomeLoss"], DURATION, "total", False, "up", None),
+    ("Interest Income", ["InterestIncomeOther", "InvestmentIncomeInterest"], DURATION, "line", False, "up", None),
+    ("Interest Expense", ["InterestExpense", "InterestAndDebtExpense"], DURATION, "line", True, "down", None),
+    ("Other Income/Expense", ["NonoperatingIncomeExpense", "OtherNonoperatingIncomeExpense"], DURATION, "line", False, None, None),
+    ("Income Before Tax", ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"], DURATION, "sub", False, "up", None),
+    ("Income Tax", ["IncomeTaxExpenseBenefit"], DURATION, "line", True, None, None),
+    ("Net Income", ["NetIncomeLoss"], DURATION, "total", False, "up", None),
+    ("EPS Basic", ["EarningsPerShareBasic"], DURATION, "eps", False, "up", None),
+    ("EPS Diluted", ["EarningsPerShareDiluted"], DURATION, "eps", False, "up", None),
+    ("EBITDA (calculated)", None, DURATION, "sub", False, "up", "ebitda"),
+]
+
+BALANCE_SPEC = [
+    ("CURRENT ASSETS", None, INSTANT, "header", False, None, None),
+    ("Cash and Equivalents", ["CashAndCashEquivalentsAtCarryingValue"], INSTANT, "line", False, "up", None),
+    ("Short-term Investments", ["ShortTermInvestments", "AvailableForSaleSecuritiesCurrent"], INSTANT, "line", False, "up", None),
+    ("Accounts Receivable", ["AccountsReceivableNetCurrent", "ReceivablesNetCurrent"], INSTANT, "line", False, None, None),
+    ("Inventories", ["InventoryNet", "AirlineRelatedInventoryNet"], INSTANT, "line", False, None, None),
+    ("Prepaid and Other", ["PrepaidExpenseAndOtherAssetsCurrent"], INSTANT, "line", False, None, None),
+    ("Total Current Assets", ["AssetsCurrent"], INSTANT, "sub", False, "up", None),
+    ("NON-CURRENT ASSETS", None, INSTANT, "header", False, None, None),
+    ("Property Plant and Equipment (net)", ["PropertyPlantAndEquipmentNet"], INSTANT, "line", False, None, None),
+    ("Operating Lease ROU Assets", ["OperatingLeaseRightOfUseAsset"], INSTANT, "line", False, None, None),
+    ("Goodwill", ["Goodwill"], INSTANT, "line", False, None, None),
+    ("Other Non-current Assets", ["OtherAssetsNoncurrent"], INSTANT, "line", False, None, None),
+    ("Total Assets", ["Assets"], INSTANT, "total", False, None, None),
+    ("CURRENT LIABILITIES", None, INSTANT, "header", False, None, None),
+    ("Accounts Payable", ["AccountsPayableCurrent"], INSTANT, "line", False, None, None),
+    ("Accrued Liabilities", ["AccruedLiabilitiesCurrent"], INSTANT, "line", False, None, None),
+    ("Air Traffic Liability", ["AirTrafficLiability", "DeferredRevenueCurrent"], INSTANT, "line", False, None, None),
+    ("Current Debt", ["DebtCurrent", "LongTermDebtCurrent"], INSTANT, "line", False, "down", None),
+    ("Current Operating Lease", ["OperatingLeaseLiabilityCurrent"], INSTANT, "line", False, "down", None),
+    ("Total Current Liabilities", ["LiabilitiesCurrent"], INSTANT, "sub", False, "down", None),
+    ("NON-CURRENT LIABILITIES", None, INSTANT, "header", False, None, None),
+    ("Long-term Debt", ["LongTermDebtNoncurrent", "LongTermDebt"], INSTANT, "line", False, "down", None),
+    ("Non-current Operating Lease", ["OperatingLeaseLiabilityNoncurrent"], INSTANT, "line", False, "down", None),
+    ("Deferred Tax", ["DeferredIncomeTaxLiabilitiesNet", "DeferredTaxLiabilitiesNoncurrent"], INSTANT, "line", False, None, None),
+    ("Other Non-current Liabilities", ["OtherLiabilitiesNoncurrent"], INSTANT, "line", False, None, None),
+    ("Total Liabilities", ["Liabilities"], INSTANT, "total", False, "down", None),
+    ("SHAREHOLDERS EQUITY", None, INSTANT, "header", False, None, None),
+    ("Common Stock", ["CommonStockValue"], INSTANT, "line", False, None, None),
+    ("Additional Paid-in Capital", ["AdditionalPaidInCapital"], INSTANT, "line", False, None, None),
+    ("Retained Earnings", ["RetainedEarningsAccumulatedDeficit"], INSTANT, "line", False, "up", None),
+    ("Treasury Stock", ["TreasuryStockValue"], INSTANT, "line", False, None, None),
+    ("Total Equity", ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"], INSTANT, "total", False, "up", None),
+    ("Total Liabilities and Equity", None, INSTANT, "total", False, None, "total_le"),
+]
+
+CASHFLOW_SPEC = [
+    ("OPERATING ACTIVITIES", None, DURATION, "header", False, None, None),
+    ("Net Income", ["NetIncomeLoss"], DURATION, "line", False, "up", None),
+    ("Depreciation and Amortization", ["DepreciationDepletionAndAmortization"], DURATION, "line", False, None, None),
+    ("Stock-based Compensation", ["ShareBasedCompensation"], DURATION, "line", False, None, None),
+    ("Changes in Working Capital", ["IncreaseDecreaseInOperatingCapital", "IncreaseDecreaseInOperatingLiabilities"], DURATION, "line", False, None, None),
+    ("Other Operating", ["OtherOperatingActivitiesCashFlowStatement"], DURATION, "line", False, None, None),
+    ("Net Cash from Operations", ["NetCashProvidedByUsedInOperatingActivities"], DURATION, "sub", False, "up", None),
+    ("INVESTING ACTIVITIES", None, DURATION, "header", False, None, None),
+    ("Capital Expenditures", ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsForFlightEquipment"], DURATION, "line", True, None, None),
+    ("Purchases of Investments", ["PaymentsToAcquireInvestments", "PaymentsToAcquireAvailableForSaleSecurities"], DURATION, "line", True, None, None),
+    ("Proceeds from Asset Sales", ["ProceedsFromSaleOfPropertyPlantAndEquipment"], DURATION, "line", False, None, None),
+    ("Other Investing", ["PaymentsForProceedsFromOtherInvestingActivities"], DURATION, "line", False, None, None),
+    ("Net Cash from Investing", ["NetCashProvidedByUsedInInvestingActivities"], DURATION, "sub", False, None, None),
+    ("FINANCING ACTIVITIES", None, DURATION, "header", False, None, None),
+    ("Debt Proceeds", ["ProceedsFromIssuanceOfLongTermDebt", "ProceedsFromDebtMaturingInMoreThanThreeMonths"], DURATION, "line", False, None, None),
+    ("Debt Repayments", ["RepaymentsOfLongTermDebt", "RepaymentsOfDebtMaturingInMoreThanThreeMonths"], DURATION, "line", True, None, None),
+    ("Dividends Paid", ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"], DURATION, "line", True, None, None),
+    ("Share Repurchases", ["PaymentsForRepurchaseOfCommonStock"], DURATION, "line", True, None, None),
+    ("Other Financing", ["ProceedsFromRepaymentsOfOtherDebt"], DURATION, "line", False, None, None),
+    ("Net Cash from Financing", ["NetCashProvidedByUsedInFinancingActivities"], DURATION, "sub", False, None, None),
+    ("Net Change in Cash", None, DURATION, "total", False, "up", "net_change"),
+    ("Beginning Cash", None, INSTANT, "line", False, None, "beginning_cash"),
+    ("Ending Cash", ["CashAndCashEquivalentsAtCarryingValue"], INSTANT, "total", False, "up", None),
+]
+
+
+def _pull(facts, concepts, kind):
+    vals, _ = concept_annual(facts, concepts, kind)
+    return vals
+
+
+def _get(vmap, label, fy):
+    d = vmap.get(label)
+    return d.get(fy) if d else None
+
+
+def _calc(stmt, key, vmap, fy, years):
+    if key == "gross_profit":
+        r, c = _get(vmap, "Total Revenue", fy), _get(vmap, "Cost of Revenue", fy)
+        return (r - c) if (r is not None and c is not None) else None
+    if key == "total_opex":
+        comps = ["Salaries and Benefits", "Aircraft Fuel", "Depreciation and Amortization",
+                 "Maintenance", "Other Operating Expenses"]
+        found = [_get(vmap, l, fy) for l in comps]
+        found = [x for x in found if x is not None]
+        return sum(found) if found else None
+    if key == "ebitda":
+        oi, da = _get(vmap, "Operating Income (EBIT)", fy), _get(vmap, "Depreciation and Amortization", fy)
+        return (oi + da) if (oi is not None and da is not None) else None
+    if key == "total_le":
+        tl, te = _get(vmap, "Total Liabilities", fy), _get(vmap, "Total Equity", fy)
+        return (tl + te) if (tl is not None and te is not None) else None
+    if key == "net_change":
+        parts = [_get(vmap, "Net Cash from Operations", fy),
+                 _get(vmap, "Net Cash from Investing", fy),
+                 _get(vmap, "Net Cash from Financing", fy)]
+        parts = [x for x in parts if x is not None]
+        return sum(parts) if parts else None
+    if key == "beginning_cash":
+        return _get(vmap, "Ending Cash", fy - 1)
+    return None
+
+
+def build_statement(facts, years, spec, stmt):
+    vmap = {}
+    for (label, concepts, kind, style, neg, direction, calc_key) in spec:
+        if concepts is not None:
+            vmap[label] = _pull(facts, concepts, kind)
+    for (label, concepts, kind, style, neg, direction, calc_key) in spec:
+        if calc_key is not None:
+            vmap[label] = {fy: _calc(stmt, calc_key, vmap, fy, years) for fy in years}
+    rows = []
+    for (label, concepts, kind, style, neg, direction, calc_key) in spec:
+        if style == "header":
+            rows.append({"label": label, "style": "header", "neg": False,
+                         "dir": None, "vals": {fy: None for fy in years}, "eps": False})
+            continue
+        valdict = vmap.get(label, {})
+        vals = {fy: valdict.get(fy) for fy in years}
+        if all(v is None for v in vals.values()):
+            continue
+        rows.append({"label": label, "style": style, "neg": neg, "dir": direction,
+                     "vals": vals, "eps": style == "eps"})
+    # drop section headers immediately followed by another header or end of list
+    cleaned = []
+    for i, r in enumerate(rows):
+        if r["style"] == "header":
+            nxt = rows[i + 1] if i + 1 < len(rows) else None
+            if nxt is None or nxt["style"] == "header":
+                continue
+        cleaned.append(r)
+    return cleaned, vmap
+
+
+def _pct_change(vals, years):
+    if len(years) < 2:
+        return None
+    a, b = vals.get(years[-2]), vals.get(years[-1])
+    if a is None or a == 0 or b is None:
+        return None
+    return (b - a) / abs(a)
+
+
+def _fmt_value(v, neg, eps):
+    if v is None:
+        return "\u2014", False
+    disp = -abs(v) if neg else v
+    if eps:
+        return f"${disp:,.2f}", disp < 0
+    return f"{disp / 1e6:,.2f}", disp < 0
+
+
+def _pct_text_color(p, direction):
+    if p is None:
+        return "\u2014", NM_TEXT
+    txt = f"{p * 100:+.1f}%"
+    if direction == "up":
+        col = GREEN_TEXT if p > 0 else (RED_TEXT if p < 0 else NM_TEXT)
+    elif direction == "down":
+        col = RED_TEXT if p > 0 else (GREEN_TEXT if p < 0 else NM_TEXT)
+    else:
+        col = NM_TEXT
+    return txt, col
+
+
+ROW_BG = {"sub": "#f3f4f6", "total": "#e5e7eb", "header": "#1e293b"}
+
+
+def render_statement_html(title, rows, years, vmap, is_balance):
+    yr_labels = [f"FY{y}" for y in years]
+    pct_label = f"% Change (FY{years[-2]}\u2192FY{years[-1]})" if len(years) >= 2 else "% Change"
+    head = "".join(f"<th style='text-align:right;padding:6px 10px;'>{h}</th>" for h in yr_labels)
+    html = [
+        f"<div style='font-weight:700;font-size:16px;margin:14px 0 4px;'>{title}</div>",
+        "<table style='width:100%;border-collapse:collapse;font-size:13px;'>",
+        f"<tr style='border-bottom:2px solid #cbd5e1;'>"
+        f"<th style='text-align:left;padding:6px 10px;'>Line Item</th>{head}"
+        f"<th style='text-align:right;padding:6px 10px;'>{pct_label}</th></tr>",
+    ]
+    for r in rows:
+        if r["style"] == "header":
+            html.append(
+                f"<tr><td colspan='{len(years) + 2}' style='background:{ROW_BG['header']};"
+                f"color:#fff;font-weight:700;padding:5px 10px;letter-spacing:.04em;'>"
+                f"{r['label']}</td></tr>"
+            )
+            continue
+        bg = ROW_BG.get(r["style"], "transparent")
+        weight = "700" if r["style"] in ("sub", "total") else "400"
+        cells = ""
+        for y in years:
+            txt, isneg = _fmt_value(r["vals"].get(y), r["neg"], r["eps"])
+            color = RED_TEXT if isneg else "#111827"
+            cells += f"<td style='text-align:right;padding:5px 10px;color:{color};'>{txt}</td>"
+        ptxt, pcol = _pct_text_color(_pct_change(r["vals"], years), r["dir"])
+        html.append(
+            f"<tr style='background:{bg};border-bottom:1px solid #f1f5f9;'>"
+            f"<td style='padding:5px 10px;font-weight:{weight};'>{r['label']}</td>"
+            f"{cells}"
+            f"<td style='text-align:right;padding:5px 10px;color:{pcol};font-weight:{weight};'>{ptxt}</td></tr>"
+        )
+    if is_balance:
+        assets = vmap.get("Total Assets", {})
+        tle = vmap.get("Total Liabilities and Equity", {})
+        chk_cells = ""
+        for y in years:
+            a, le = assets.get(y), tle.get(y)
+            if a is None or le is None or a == 0:
+                chk_cells += "<td style='text-align:right;padding:5px 10px;color:#6b7280;'>\u2014</td>"
+            elif abs(a - le) <= 0.01 * abs(a):
+                chk_cells += f"<td style='text-align:right;padding:5px 10px;color:{GREEN_TEXT};font-weight:700;'>\u2713 Balanced</td>"
+            else:
+                chk_cells += f"<td style='text-align:right;padding:5px 10px;color:{AMBER_TEXT};font-weight:700;'>\u26a0 Check</td>"
+        html.append(
+            f"<tr style='background:{ROW_BG['sub']};'>"
+            f"<td style='padding:5px 10px;font-weight:700;'>Balance Check</td>{chk_cells}"
+            f"<td style='padding:5px 10px;'></td></tr>"
+        )
+    html.append("</table>")
+    return "".join(html)
+
+
+def build_airline_statements_excel(name, ticker, facts, years):
+    wb = Workbook()
+    bold = Font(bold=True)
+    red = Font(color="b91c1c")
+    red_bold = Font(bold=True, color="b91c1c")
+    sub_fill = PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid")
+    total_fill = PatternFill(start_color="E5E7EB", end_color="E5E7EB", fill_type="solid")
+
+    sheets = [
+        ("Income Statement", INCOME_SPEC, "income", False),
+        ("Balance Sheet", BALANCE_SPEC, "balance", True),
+        ("Cash Flow", CASHFLOW_SPEC, "cashflow", False),
+    ]
+    first = True
+    for sheet_name, spec, stmt, is_bal in sheets:
+        rows, vmap = build_statement(facts, years, spec, stmt)
+        ws = wb.active if first else wb.create_sheet(sheet_name)
+        if first:
+            ws.title = sheet_name
+            first = False
+        header = ["Line Item"] + [f"FY{y}" for y in years]
+        header += [f"% Change FY{years[-2]}->FY{years[-1]}" if len(years) >= 2 else "% Change"]
+        for j, h in enumerate(header, start=1):
+            ws.cell(row=1, column=j, value=h).font = bold
+        rownum = 2
+        for r in rows:
+            if r["style"] == "header":
+                c = ws.cell(row=rownum, column=1, value=r["label"])
+                c.font = bold
+                rownum += 1
+                continue
+            is_tot = r["style"] in ("sub", "total")
+            ws.cell(row=rownum, column=1, value=r["label"]).font = bold if is_tot else None
+            for k, y in enumerate(years, start=2):
+                v = r["vals"].get(y)
+                if v is None:
+                    cell = ws.cell(row=rownum, column=k, value=None)
+                else:
+                    disp = -abs(v) if r["neg"] else v
+                    out = round(disp, 2) if r["eps"] else round(disp / 1e6, 2)
+                    cell = ws.cell(row=rownum, column=k, value=out)
+                    if out < 0:
+                        cell.font = red_bold if is_tot else red
+                    elif is_tot:
+                        cell.font = bold
+            p = _pct_change(r["vals"], years)
+            ws.cell(row=rownum, column=len(years) + 2,
+                    value=(f"{p * 100:+.1f}%" if p is not None else None))
+            if is_tot:
+                fill = total_fill if r["style"] == "total" else sub_fill
+                for col in range(1, len(years) + 3):
+                    ws.cell(row=rownum, column=col).fill = fill
+            rownum += 1
+        if is_bal:
+            assets = vmap.get("Total Assets", {})
+            tle = vmap.get("Total Liabilities and Equity", {})
+            ws.cell(row=rownum, column=1, value="Balance Check").font = bold
+            for k, y in enumerate(years, start=2):
+                a, le = assets.get(y), tle.get(y)
+                if a is None or le is None or a == 0:
+                    txt = "\u2014"
+                elif abs(a - le) <= 0.01 * abs(a):
+                    txt = "Balanced"
+                else:
+                    txt = "Check"
+                ws.cell(row=rownum, column=k, value=txt).font = bold
+        ws.column_dimensions["A"].width = 34
+        for k in range(2, len(years) + 3):
+            ws.column_dimensions[ws.cell(row=1, column=k).column_letter].width = 16
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Credit Summary", "Trends", "Peer Ranking", "Raw Data", "Financial Statements"
+])
 
 # ----------------------------------------------------------------------------
 # TAB 1 \u2014 Credit Summary
@@ -791,5 +1122,53 @@ with tab4:
     st.dataframe(styler, use_container_width=True)
     st.caption("Data sourced from SEC EDGAR XBRL 10-K filings. "
                "Verify against primary filings for investment decisions.")
+
+# ----------------------------------------------------------------------------
+# TAB 5 \u2014 Financial Statements
+# ----------------------------------------------------------------------------
+with tab5:
+    st.subheader("Financial Statements")
+    fs_airline = st.selectbox("Select Airline", airlines, key="fs_airline")
+    fs_years = data[fs_airline]["years"]
+    fs_ticker = data[fs_airline]["ticker"]
+
+    if not fs_years:
+        st.info("No fiscal-year data available for this airline.")
+    else:
+        try:
+            fs_facts = fetch_companyfacts(AIRLINES[fs_airline]["cik"])
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Request failed for {fs_airline}: {exc}")
+            fs_facts = None
+
+        if fs_facts is not None:
+            inc_rows, inc_vmap = build_statement(fs_facts, fs_years, INCOME_SPEC, "income")
+            bal_rows, bal_vmap = build_statement(fs_facts, fs_years, BALANCE_SPEC, "balance")
+            cf_rows, cf_vmap = build_statement(fs_facts, fs_years, CASHFLOW_SPEC, "cashflow")
+
+            xlsx_bytes = build_airline_statements_excel(fs_airline, fs_ticker, fs_facts, fs_years)
+            st.download_button(
+                f"\u2b07 Download {fs_airline} Financials to Excel",
+                data=xlsx_bytes,
+                file_name=f"{fs_ticker}_Financials_{date.today().isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="fs_download",
+            )
+            st.caption("Values in $millions (2dp) unless marked EPS ($/share). "
+                       "Rows with no data across all years are hidden. Many airline-specific "
+                       "line items are filed as company extension tags and may not appear.")
+
+            st.markdown(
+                render_statement_html("Income Statement", inc_rows, fs_years, inc_vmap, False),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                render_statement_html("Balance Sheet", bal_rows, fs_years, bal_vmap, True),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                render_statement_html("Cash Flow Statement", cf_rows, fs_years, cf_vmap, False),
+                unsafe_allow_html=True,
+            )
 
 # To run: streamlit run app.py
