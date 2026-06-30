@@ -9,6 +9,7 @@ from datetime import date
 import json
 import io
 import statistics
+import yfinance as yf
 
 st.set_page_config(
     page_title="Aviation Finance Dashboard",
@@ -115,6 +116,44 @@ def fetch_companyfacts(cik):
     resp = requests.get(url, headers=SEC_HEADERS, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def fetch_stock_info(ticker):
+    """Price + market cap via yfinance. Degrades to None on any failure."""
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        return {"price": None, "prev": None, "mcap": None}
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    return {"price": price, "prev": info.get("previousClose"), "mcap": info.get("marketCap")}
+
+
+def fmt_mcap(m):
+    if m is None:
+        return "\u2014"
+    if m >= 1_000_000_000:
+        return f"${m / 1e9:.1f}B"
+    if m >= 1_000_000:
+        return f"${m / 1e6:.1f}M"
+    return f"${m:,.0f}"
+
+
+def price_line_html(stock):
+    price = stock.get("price")
+    prev = stock.get("prev")
+    mcap = stock.get("mcap")
+    if price is None:
+        return "<span style='color:#9ca3af;'>price unavailable</span>"
+    chg_html = ""
+    if prev:
+        chg = price - prev
+        pct = chg / prev * 100 if prev else 0.0
+        arrow = "\u25b2" if chg >= 0 else "\u25bc"
+        col = GREEN_TEXT if chg >= 0 else RED_TEXT
+        chg_html = f" <span style='color:{col};'>{arrow} {pct:+.1f}%</span>"
+    mcap_html = f" | Mkt Cap: {fmt_mcap(mcap)}" if mcap else ""
+    return f"${price:,.2f}{chg_html}{mcap_html}"
 
 
 def concept_annual(facts_root, concepts, kind):
@@ -396,19 +435,46 @@ if load:
                 data[name] = build_airline(name, AIRLINES[name])
             except requests.exceptions.RequestException as exc:
                 st.error(f"Request failed for {name}: {exc}")
+                continue
             except (ValueError, KeyError, json.JSONDecodeError) as exc:
                 st.error(f"Could not parse SEC data for {name}: {exc}")
+                continue
+            data[name]["stock"] = fetch_stock_info(AIRLINES[name]["ticker"])
     st.session_state.data = data
-    st.session_state.peer_mode = len(data) >= 4
 
 data = st.session_state.data
-peer_mode = st.session_state.peer_mode
+peer_mode = len(data) >= 4
 
 if data:
     mode_label = "peer comparison" if peer_mode else "absolute thresholds"
     st.sidebar.success(f"{len(data)} airline(s) loaded \u2014 using {mode_label}.")
     if not peer_mode:
         st.sidebar.warning("Peer comparison requires 4+ airlines. Using absolute thresholds.")
+
+    st.sidebar.markdown("---")
+    remove = None
+    for name in list(data.keys()):
+        stock = data[name].get("stock") or {}
+        ticker = data[name]["ticker"]
+        c1, c2 = st.sidebar.columns([6, 1])
+        c1.markdown(
+            f"<div style='line-height:1.3;'>"
+            f"<div style='font-weight:600;font-size:13px;'>{name} "
+            f"<span style='color:#6b7280;'>({ticker})</span></div>"
+            f"<div style='font-size:11px;'>{price_line_html(stock)}</div></div>",
+            unsafe_allow_html=True,
+        )
+        if c2.button("\u00d7", key=f"rm_{name}", help=f"Remove {name}"):
+            remove = name
+    if remove is not None:
+        del st.session_state.data[remove]
+        st.rerun()
+
+    st.sidebar.markdown(
+        "<div style='font-size:10px;color:#9ca3af;font-style:italic;margin-top:6px;'>"
+        "Prices delayed ~15 min. Source: Yahoo Finance</div>",
+        unsafe_allow_html=True,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -930,6 +996,350 @@ def build_airline_statements_excel(name, ticker, facts, years):
     return buf.getvalue()
 
 
+# ----------------------------------------------------------------------------
+# yfinance financial-statements engine (Financial Statements tab)
+# ----------------------------------------------------------------------------
+# Row spec: (yf_label, display_label, style, special, direction)
+#   style:     "line" | "bold" (#f8fafc) | "sub" (#f1f5f9)
+#   special:   None (=> $M, 2dp) | "eps" ($/share) | "pct" (%)
+#   direction: "up" (green if rising) | "down" (red if rising) | None (neutral)
+# yfinance row labels drift across versions; matching is case/space-insensitive
+# with a small alias map, and missing rows are skipped silently per spec.
+
+YF_ALIASES = {
+    "operating expense": ["operating expenses", "total operating expenses"],
+    "operating income": ["operating income loss", "ebit"],
+    "tax provision": ["income tax expense", "tax provision benefit"],
+    "pretax income": ["income before tax", "pre tax income"],
+    "net ppe": ["net property plant and equipment", "property plant and equipment net"],
+    "total liabilities net minority interest": ["total liabilities"],
+    "total equity gross minority interest": ["total equity"],
+    "stockholders equity": ["common stock equity", "total stockholders equity"],
+    "operating cash flow": ["cash flow from operations", "total cash from operating activities"],
+    "investing cash flow": ["total cash from investing activities"],
+    "financing cash flow": ["total cash from financing activities"],
+    "end cash position": ["ending cash position", "end cash position"],
+    "total revenue": ["total revenues", "revenue"],
+}
+
+INCOME_YF = [
+    ("Total Revenue", "Total Revenue", "line", None, "up"),
+    ("Cost Of Revenue", "Cost of Revenue", "line", None, "down"),
+    ("Gross Profit", "Gross Profit", "sub", None, "up"),
+    ("Operating Expense", "Total Operating Expenses", "bold", None, "down"),
+    ("Operating Income", "Operating Income / EBIT", "bold", None, "up"),
+    ("EBITDA", "EBITDA", "bold", None, None),
+    ("Interest Expense", "Interest Expense", "line", None, "down"),
+    ("Interest Income", "Interest Income", "line", None, "up"),
+    ("Pretax Income", "Income Before Tax", "line", None, "up"),
+    ("Tax Provision", "Income Tax Expense", "line", None, "down"),
+    ("Net Income", "Net Income", "bold", None, "up"),
+    ("__NET_MARGIN__", "Net Margin %", "line", "pct", "up"),
+    ("Basic EPS", "EPS Basic ($)", "eps", "eps", None),
+    ("Diluted EPS", "EPS Diluted ($)", "eps", "eps", None),
+    ("Normalized EBITDA", "Normalized EBITDA", "line", None, None),
+]
+
+BALANCE_YF = [
+    ("Cash And Cash Equivalents", "Cash & Equivalents", "line", None, None),
+    ("Short Term Investments", "Short-term Investments", "line", None, None),
+    ("Accounts Receivable", "Accounts Receivable", "line", None, None),
+    ("Inventory", "Inventory", "line", None, None),
+    ("Current Assets", "Total Current Assets", "sub", None, None),
+    ("Net PPE", "Property, Plant & Equipment (net)", "line", None, None),
+    ("Goodwill", "Goodwill", "line", None, None),
+    ("Total Assets", "Total Assets", "sub", None, None),
+    ("Accounts Payable", "Accounts Payable", "line", None, None),
+    ("Current Debt", "Current Portion of Debt", "line", None, "down"),
+    ("Current Liabilities", "Total Current Liabilities", "sub", None, "down"),
+    ("Long Term Debt", "Long-term Debt", "line", None, "down"),
+    ("Total Liabilities Net Minority Interest", "Total Liabilities", "sub", None, "down"),
+    ("Stockholders Equity", "Total Stockholders Equity", "bold", None, "up"),
+    ("Total Equity Gross Minority Interest", "Total Equity", "sub", None, "up"),
+    ("Total Capitalization", "Total Capitalization", "line", None, None),
+]
+
+CASHFLOW_YF = [
+    ("Net Income", "Net Income", "line", None, "up"),
+    ("Depreciation And Amortization", "Depreciation & Amortization", "line", None, None),
+    ("Change In Working Capital", "Changes in Working Capital", "line", None, None),
+    ("Operating Cash Flow", "Cash from Operations", "sub", None, None),
+    ("Capital Expenditure", "Capital Expenditures", "line", None, None),
+    ("Purchase Of Investment", "Purchases of Investments", "line", None, None),
+    ("Sale Of Investment", "Proceeds from Investment Sales", "line", None, None),
+    ("Investing Cash Flow", "Cash from Investing", "sub", None, None),
+    ("Issuance Of Debt", "Debt Proceeds", "line", None, None),
+    ("Repayment Of Debt", "Debt Repayments", "line", None, "down"),
+    ("Repurchase Of Capital Stock", "Share Repurchases", "line", None, None),
+    ("Payment Of Dividends", "Dividends Paid", "line", None, None),
+    ("Financing Cash Flow", "Cash from Financing", "sub", None, None),
+    ("End Cash Position", "Ending Cash Balance", "bold", None, None),
+    ("Free Cash Flow", "Free Cash Flow", "bold", None, "up"),
+    ("__FCF_MARGIN__", "FCF Margin %", "line", "pct", "up"),
+]
+
+YF_BG = {"bold": "#f8fafc", "sub": "#f1f5f9", "line": "transparent"}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_yf_statements(ticker):
+    out = {}
+    try:
+        t = yf.Ticker(ticker)
+        getters = {
+            "fin": lambda: t.financials, "bs": lambda: t.balance_sheet, "cf": lambda: t.cashflow,
+            "qfin": lambda: t.quarterly_financials, "qbs": lambda: t.quarterly_balance_sheet,
+            "qcf": lambda: t.quarterly_cashflow,
+        }
+        for k, g in getters.items():
+            try:
+                df = g()
+                out[k] = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            except Exception:
+                out[k] = pd.DataFrame()
+    except Exception:
+        pass
+    for k in ["fin", "bs", "cf", "qfin", "qbs", "qcf"]:
+        out.setdefault(k, pd.DataFrame())
+    return out
+
+
+def _yf_find(df, yf_label):
+    """Resolve a display/yf label to an actual DataFrame index label, or None."""
+    if df is None or df.empty:
+        return None
+    norm = {str(idx).strip().lower(): idx for idx in df.index}
+    candidates = [yf_label.strip().lower()]
+    candidates += YF_ALIASES.get(yf_label.strip().lower(), [])
+    for c in candidates:
+        if c in norm:
+            return norm[c]
+    return None
+
+
+def _yf_series(df, yf_label, cols):
+    idx = _yf_find(df, yf_label)
+    if idx is None:
+        return {c: None for c in cols}
+    row = df.loc[idx]
+    out = {}
+    for c in cols:
+        try:
+            v = row[c]
+            out[c] = None if pd.isna(v) else float(v)
+        except Exception:
+            out[c] = None
+    return out
+
+
+def _col_label(ts, period):
+    try:
+        if period == "Annual":
+            return f"FY{ts.year}"
+        return f"Q{(ts.month - 1) // 3 + 1} {ts.year}"
+    except Exception:
+        return str(ts)
+
+
+def prepare_yf_statement(df, spec, period, n, revenue_df=None, fcf_df=None):
+    """Return (col_labels_ascending, columns, rows). Rows include calc rows."""
+    if df is None or df.empty:
+        return [], [], []
+    cols = list(df.columns)[:n]            # yfinance: most recent first
+    cols = sorted(cols)                    # ascending for display
+    labels = [_col_label(c, period) for c in cols]
+
+    # revenue per column for margins (match by column label)
+    rev_by_label = {}
+    if revenue_df is not None and not revenue_df.empty:
+        rcols = sorted(list(revenue_df.columns)[:n])
+        rser = _yf_series(revenue_df, "Total Revenue", rcols)
+        rev_by_label = {_col_label(c, period): rser.get(c) for c in rcols}
+
+    rows = []
+    for yf_label, disp, style, special, direction in spec:
+        if yf_label == "__NET_MARGIN__":
+            ni = next((r for r in rows if r["disp"] == "Net Income"), None)
+            vals = {}
+            for c in cols:
+                lab = _col_label(c, period)
+                rev = rev_by_label.get(lab)
+                niv = ni["raw"].get(c) if ni else None
+                vals[c] = (niv / rev * 100) if (ni and niv is not None and rev not in (None, 0)) else None
+            rows.append({"disp": disp, "style": style, "special": special,
+                         "dir": direction, "raw": vals})
+            continue
+        if yf_label == "__FCF_MARGIN__":
+            fcf = next((r for r in rows if r["disp"] == "Free Cash Flow"), None)
+            vals = {}
+            for c in cols:
+                lab = _col_label(c, period)
+                rev = rev_by_label.get(lab)
+                fv = fcf["raw"].get(c) if fcf else None
+                vals[c] = (fv / rev * 100) if (fcf and fv is not None and rev not in (None, 0)) else None
+            rows.append({"disp": disp, "style": style, "special": special,
+                         "dir": direction, "raw": vals})
+            continue
+        series = _yf_series(df, yf_label, cols)
+        if all(v is None for v in series.values()):
+            continue
+        rows.append({"disp": disp, "style": style, "special": special,
+                     "dir": direction, "raw": series})
+    return labels, cols, rows
+
+
+def _yf_fmt(v, special):
+    if v is None:
+        return "\u2014", False
+    if special == "eps":
+        return f"${v:,.2f}", v < 0
+    if special == "pct":
+        return f"{v:.1f}%", v < 0
+    return f"{v / 1e6:,.2f}", v < 0
+
+
+def _yf_pct(raw, cols, direction):
+    if len(cols) < 2:
+        return "\u2014", NM_TEXT
+    a, b = raw.get(cols[-2]), raw.get(cols[-1])
+    if a is None or a == 0 or b is None:
+        return "\u2014", NM_TEXT
+    p = (b - a) / abs(a)
+    txt = f"{p * 100:+.1f}%"
+    if direction == "up":
+        col = GREEN_TEXT if p > 0 else (RED_TEXT if p < 0 else NM_TEXT)
+    elif direction == "down":
+        col = RED_TEXT if p > 0 else (GREEN_TEXT if p < 0 else NM_TEXT)
+    else:
+        col = NM_TEXT
+    return txt, col
+
+
+def render_yf_html(title, labels, cols, rows, period, balance_extra=None):
+    head = "".join(f"<th style='text-align:right;padding:6px 10px;'>{h}</th>" for h in labels)
+    pct_hdr = f"% \u0394 ({labels[-2]}\u2192{labels[-1]})" if len(labels) >= 2 else "% \u0394"
+    html = [
+        f"<div style='font-weight:700;font-size:16px;margin:14px 0 4px;'>{title}</div>",
+        "<table style='width:100%;border-collapse:collapse;font-size:13px;'>",
+        f"<tr style='border-bottom:2px solid #cbd5e1;'>"
+        f"<th style='text-align:left;padding:6px 10px;'>Line Item</th>{head}"
+        f"<th style='text-align:right;padding:6px 10px;'>{pct_hdr}</th></tr>",
+    ]
+    for r in rows:
+        bg = YF_BG.get(r["style"], "transparent")
+        weight = "700" if r["style"] in ("bold", "sub") else "400"
+        cells = ""
+        for c in cols:
+            txt, isneg = _yf_fmt(r["raw"].get(c), r["special"])
+            color = RED_TEXT if isneg else "#111827"
+            cells += f"<td style='text-align:right;padding:5px 10px;color:{color};'>{txt}</td>"
+        ptxt, pcol = _yf_pct(r["raw"], cols, r["dir"])
+        html.append(
+            f"<tr style='background:{bg};border-bottom:1px solid #f1f5f9;'>"
+            f"<td style='padding:5px 10px;font-weight:{weight};'>{r['disp']}</td>{cells}"
+            f"<td style='text-align:right;padding:5px 10px;color:{pcol};font-weight:{weight};'>{ptxt}</td></tr>"
+        )
+    if balance_extra is not None:
+        assets, tl, te = balance_extra
+        chk = ""
+        for c in cols:
+            a = assets.get(c)
+            le = (tl.get(c) or 0) + (te.get(c) or 0) if (tl.get(c) is not None or te.get(c) is not None) else None
+            if a is None or le is None or a == 0:
+                chk += "<td style='text-align:right;padding:5px 10px;color:#6b7280;'>\u2014</td>"
+            elif abs(a - le) < 0.01 * abs(a):
+                chk += f"<td style='text-align:right;padding:5px 10px;color:{GREEN_TEXT};font-weight:700;'>\u2713 Balanced</td>"
+            else:
+                chk += f"<td style='text-align:right;padding:5px 10px;color:{AMBER_TEXT};font-weight:700;'>\u26a0 Review</td>"
+        html.append(f"<tr style='background:{YF_BG['sub']};'>"
+                    f"<td style='padding:5px 10px;font-weight:700;'>Balance Check</td>{chk}"
+                    f"<td style='padding:5px 10px;'></td></tr>")
+    html.append("</table>")
+    return "".join(html)
+
+
+def _xl_write_yf(ws, labels, cols, rows, balance_extra=None):
+    bold = Font(bold=True)
+    red = Font(color="b91c1c")
+    red_bold = Font(bold=True, color="b91c1c")
+    sub_fill = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+    bold_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+    header = ["Line Item"] + labels + ([f"% Change {labels[-2]}->{labels[-1]}"] if len(labels) >= 2 else ["% Change"])
+    for j, h in enumerate(header, start=1):
+        ws.cell(row=1, column=j, value=h).font = bold
+    rn = 2
+    for r in rows:
+        is_b = r["style"] in ("bold", "sub")
+        ws.cell(row=rn, column=1, value=r["disp"]).font = bold if is_b else None
+        for k, c in enumerate(cols, start=2):
+            v = r["raw"].get(c)
+            if v is None:
+                ws.cell(row=rn, column=k, value=None)
+                continue
+            if r["special"] == "eps":
+                out = round(v, 2)
+            elif r["special"] == "pct":
+                out = round(v, 1)
+            else:
+                out = round(v / 1e6, 2)
+            cell = ws.cell(row=rn, column=k, value=out)
+            if out < 0:
+                cell.font = red_bold if is_b else red
+            elif is_b:
+                cell.font = bold
+        ptxt, _ = _yf_pct(r["raw"], cols, r["dir"])
+        ws.cell(row=rn, column=len(cols) + 2, value=(ptxt if ptxt != "\u2014" else None))
+        if is_b:
+            fill = sub_fill if r["style"] == "sub" else bold_fill
+            for col in range(1, len(cols) + 3):
+                ws.cell(row=rn, column=col).fill = fill
+        rn += 1
+    if balance_extra is not None:
+        assets, tl, te = balance_extra
+        ws.cell(row=rn, column=1, value="Balance Check").font = bold
+        for k, c in enumerate(cols, start=2):
+            a = assets.get(c)
+            le = (tl.get(c) or 0) + (te.get(c) or 0) if (tl.get(c) is not None or te.get(c) is not None) else None
+            txt = "\u2014" if (a is None or le is None or a == 0) else ("Balanced" if abs(a - le) < 0.01 * abs(a) else "Review")
+            ws.cell(row=rn, column=k, value=txt).font = bold
+    ws.column_dimensions["A"].width = 34
+    for k in range(2, len(cols) + 3):
+        ws.column_dimensions[ws.cell(row=1, column=k).column_letter].width = 15
+
+
+def build_yf_excel(ticker, stmts):
+    wb = Workbook()
+    plans = [
+        ("Income Statement - Annual", stmts["fin"], INCOME_YF, "Annual", 3),
+        ("Income Statement - Quarterly", stmts["qfin"], INCOME_YF, "Quarterly", 4),
+        ("Balance Sheet - Annual", stmts["bs"], BALANCE_YF, "Annual", 3),
+        ("Balance Sheet - Quarterly", stmts["qbs"], BALANCE_YF, "Quarterly", 4),
+        ("Cash Flow - Annual", stmts["cf"], CASHFLOW_YF, "Annual", 3),
+        ("Cash Flow - Quarterly", stmts["qcf"], CASHFLOW_YF, "Quarterly", 4),
+    ]
+    first = True
+    for sheet_name, df, spec, period, n in plans:
+        ws = wb.active if first else wb.create_sheet(sheet_name)
+        if first:
+            ws.title = sheet_name
+            first = False
+        rev_df = stmts["fin"] if period == "Annual" else stmts["qfin"]
+        labels, cols, rows = prepare_yf_statement(df, spec, period, n, revenue_df=rev_df)
+        if not labels:
+            ws.cell(row=1, column=1, value="No data available from Yahoo Finance.")
+            continue
+        extra = None
+        if "Balance" in sheet_name:
+            extra = (_yf_series(df, "Total Assets", cols),
+                     _yf_series(df, "Total Liabilities Net Minority Interest", cols),
+                     _yf_series(df, "Total Equity Gross Minority Interest", cols))
+        _xl_write_yf(ws, labels, cols, rows, balance_extra=extra)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Credit Summary", "Trends", "Peer Ranking", "Raw Data", "Financial Statements"
 ])
@@ -1129,46 +1539,61 @@ with tab4:
 with tab5:
     st.subheader("Financial Statements")
     fs_airline = st.selectbox("Select Airline", airlines, key="fs_airline")
-    fs_years = data[fs_airline]["years"]
+    fs_period = st.radio("Period", ["Annual", "Quarterly"], horizontal=True, key="fs_period")
     fs_ticker = data[fs_airline]["ticker"]
+    n_periods = 3 if fs_period == "Annual" else 4
 
-    if not fs_years:
-        st.info("No fiscal-year data available for this airline.")
+    stmts = fetch_yf_statements(fs_ticker)
+
+    inc_df = stmts["fin"] if fs_period == "Annual" else stmts["qfin"]
+    bal_df = stmts["bs"] if fs_period == "Annual" else stmts["qbs"]
+    cf_df = stmts["cf"] if fs_period == "Annual" else stmts["qcf"]
+
+    if inc_df.empty and bal_df.empty and cf_df.empty:
+        st.error(
+            f"No financial-statement data returned from Yahoo Finance for {fs_ticker}. "
+            "This is common for delisted or recently acquired carriers, or when Yahoo "
+            "rate-limits the request. Try again shortly or pick another airline."
+        )
     else:
-        try:
-            fs_facts = fetch_companyfacts(AIRLINES[fs_airline]["cik"])
-        except requests.exceptions.RequestException as exc:
-            st.error(f"Request failed for {fs_airline}: {exc}")
-            fs_facts = None
+        xlsx_bytes = build_yf_excel(fs_ticker, stmts)
+        st.download_button(
+            f"\u2b07 Download {fs_airline} Financials to Excel",
+            data=xlsx_bytes,
+            file_name=f"{fs_ticker}_Financials_{date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="fs_download",
+        )
+        st.caption(
+            "Source: Yahoo Finance (yfinance). Values in $millions (2dp) unless marked "
+            "EPS ($/share) or % (margins). Rows absent from Yahoo's data are skipped. "
+            "Excel export includes both Annual and Quarterly sheets. "
+            + ("Note: quarterly %\u0394 is period-over-period (seasonal), not year-on-year."
+               if fs_period == "Quarterly" else "")
+        )
 
-        if fs_facts is not None:
-            inc_rows, inc_vmap = build_statement(fs_facts, fs_years, INCOME_SPEC, "income")
-            bal_rows, bal_vmap = build_statement(fs_facts, fs_years, BALANCE_SPEC, "balance")
-            cf_rows, cf_vmap = build_statement(fs_facts, fs_years, CASHFLOW_SPEC, "cashflow")
+        i_labels, i_cols, i_rows = prepare_yf_statement(inc_df, INCOME_YF, fs_period, n_periods, revenue_df=inc_df)
+        if i_labels:
+            st.markdown(render_yf_html("Income Statement", i_labels, i_cols, i_rows, fs_period),
+                        unsafe_allow_html=True)
+        else:
+            st.info("No income statement data available.")
 
-            xlsx_bytes = build_airline_statements_excel(fs_airline, fs_ticker, fs_facts, fs_years)
-            st.download_button(
-                f"\u2b07 Download {fs_airline} Financials to Excel",
-                data=xlsx_bytes,
-                file_name=f"{fs_ticker}_Financials_{date.today().isoformat()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="fs_download",
-            )
-            st.caption("Values in $millions (2dp) unless marked EPS ($/share). "
-                       "Rows with no data across all years are hidden. Many airline-specific "
-                       "line items are filed as company extension tags and may not appear.")
+        b_labels, b_cols, b_rows = prepare_yf_statement(bal_df, BALANCE_YF, fs_period, n_periods)
+        if b_labels:
+            extra = (_yf_series(bal_df, "Total Assets", b_cols),
+                     _yf_series(bal_df, "Total Liabilities Net Minority Interest", b_cols),
+                     _yf_series(bal_df, "Total Equity Gross Minority Interest", b_cols))
+            st.markdown(render_yf_html("Balance Sheet", b_labels, b_cols, b_rows, fs_period,
+                                       balance_extra=extra), unsafe_allow_html=True)
+        else:
+            st.info("No balance sheet data available.")
 
-            st.markdown(
-                render_statement_html("Income Statement", inc_rows, fs_years, inc_vmap, False),
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                render_statement_html("Balance Sheet", bal_rows, fs_years, bal_vmap, True),
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                render_statement_html("Cash Flow Statement", cf_rows, fs_years, cf_vmap, False),
-                unsafe_allow_html=True,
-            )
+        c_labels, c_cols, c_rows = prepare_yf_statement(cf_df, CASHFLOW_YF, fs_period, n_periods, revenue_df=inc_df)
+        if c_labels:
+            st.markdown(render_yf_html("Cash Flow Statement", c_labels, c_cols, c_rows, fs_period),
+                        unsafe_allow_html=True)
+        else:
+            st.info("No cash flow data available.")
 
 # To run: streamlit run app.py
