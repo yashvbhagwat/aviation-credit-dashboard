@@ -971,8 +971,13 @@ st.download_button(
 # ----------------------------------------------------------------------------
 WIKI_HEADERS = {"User-Agent": "Mozilla/5.0 (Aviation Finance Dashboard)"}
 TICKER_TO_SUGGESTION = {v: k for k, v in AIRLINE_SUGGESTIONS.items()}
-AC_HINTS = ("boeing", "airbus", "atr", "embraer", "bombardier", "mcdonnell",
-            "de havilland", "comac", "cessna", "saab", "fokker", "sukhoi", "antonov")
+AC_MAKERS = ("boeing", "airbus", "atr", "embraer", "bombardier", "mcdonnell douglas",
+             "de havilland", "comac", "sukhoi", "antonov", "saab", "fokker")
+# Header substrings that mark an infobox / non-fleet table and must cause rejection.
+FLEET_REJECT = ("isin", "employees", "destinations", "revenue", "traded as",
+                "subsidiaries", "commenced operations", "headquarters", "founded",
+                "operating income", "net income", "total assets", "website",
+                "frequent-flyer", "alliance", "parent company")
 
 
 def _clean_text(x):
@@ -995,73 +1000,93 @@ def _norm_cols(df):
     return cols
 
 
-def _identify_fleet_cols(df):
+def _has_maker(text):
+    t = text.lower()
+    return any(m in t for m in AC_MAKERS)
+
+
+def _strict_fleet_cols(df):
+    """Strict identification. Returns (aircraft_idx, in_service_idx) or None.
+
+    Requires an 'Aircraft' header AND an 'In service'/'In fleet' header, rejects
+    any table carrying infobox-style headers, and never selects an 'Orders' column.
+    """
     if df.shape[1] < 2:
         return None
     cols = _norm_cols(df)
-    ac_idx = None
-    for i, h in enumerate(cols):
-        if "aircraft" in h or h == "type" or h.endswith(" type"):
-            ac_idx = i
-            break
-    if ac_idx is None:
-        first = df.iloc[:, 0].astype(str).str.lower()
-        if first.str.contains("|".join(AC_HINTS), regex=True).any():
-            ac_idx = 0
+    if any(any(bad in h for bad in FLEET_REJECT) for h in cols):
+        return None
+    ac_idx = next((i for i, h in enumerate(cols) if "aircraft" in h), None)
     if ac_idx is None:
         return None
-    # count column: prefer a header naming in-service/fleet/active, never "orders"
-    cnt_idx = None
-    for i, h in enumerate(cols):
-        if i == ac_idx or "order" in h:
-            continue
-        if any(k in h for k in ("in service", "service", "in fleet", "fleet",
-                                "active", "in operation", "operation", "operated")):
-            cnt_idx = i
-            break
-    if cnt_idx is None:
-        best, best_frac = None, 0.0
-        for i in range(df.shape[1]):
-            if i == ac_idx:
-                continue
-            parsed = [_to_count(v) for v in df.iloc[:, i]]
-            frac = sum(1 for v, flag in parsed if not flag and v > 0) / max(1, len(parsed))
-            if frac > best_frac:
-                best, best_frac = i, frac
-        if best is not None and best_frac >= 0.5:
-            cnt_idx = best
+    cnt_idx = next((i for i, h in enumerate(cols)
+                    if i != ac_idx and "order" not in h
+                    and ("in service" in h or "in fleet" in h)), None)
     if cnt_idx is None:
         return None
     return ac_idx, cnt_idx
 
 
-def _extract_fleet_rows(df, ac_idx, cnt_idx):
-    rows, flagged = [], False
-    for _, r in df.iterrows():
-        ac = _clean_text(r.iloc[ac_idx])
-        if not ac or ac.lower() == "nan":
-            continue
-        if "total" in ac.lower():
-            continue
-        cnt, flag = _to_count(r.iloc[cnt_idx])
-        flagged = flagged or flag
-        rows.append((ac, cnt))
-    return rows, flagged
-
-
 def parse_fleet(tables):
-    """Return (DataFrame|None, total, flagged). Picks the first plausible fleet table."""
+    """Return (DataFrame|None, total, flagged) for the first table passing strict checks."""
     for df in tables:
-        ident = _identify_fleet_cols(df)
+        ident = _strict_fleet_cols(df)
         if not ident:
             continue
         ac_idx, cnt_idx = ident
-        rows, flagged = _extract_fleet_rows(df, ac_idx, cnt_idx)
-        if len(rows) >= 2 and any(c > 0 for _, c in rows):
-            out = pd.DataFrame(rows, columns=["Aircraft Type", "In Service"])
-            out = out.sort_values("In Service", ascending=False).reset_index(drop=True)
-            return out, int(out["In Service"].sum()), flagged
+        rows, flagged = [], False
+        for _, r in df.iterrows():
+            ac = _clean_text(r.iloc[ac_idx])
+            if not ac or ac.lower() == "nan" or "total" in ac.lower():
+                continue
+            if not _has_maker(ac):           # drop summary / stray rows
+                continue
+            cnt, flag = _to_count(r.iloc[cnt_idx])
+            flagged = flagged or flag
+            rows.append((ac, cnt))
+        if len(rows) < 3:                    # a real fleet table lists several types
+            continue
+        out = pd.DataFrame(rows, columns=["Aircraft Type", "In Service"])
+        # merged multi-row variants repeat a model: keep one row per type
+        out = out.drop_duplicates(subset="Aircraft Type", keep="first").reset_index(drop=True)
+        if len(out) < 3:
+            continue
+        out = out.sort_values("In Service", ascending=False).reset_index(drop=True)
+        return out, int(out["In Service"].sum()), flagged
     return None, 0, False
+
+
+def _table_after_fleet_heading(html):
+    """Return the HTML of the first <table> following the page's 'Fleet' heading."""
+    try:
+        import lxml.html as LH
+        doc = LH.fromstring(html)
+    except Exception:
+        return None
+    els = list(doc.iter())
+    start = None
+    for i, el in enumerate(els):
+        tag = el.tag if isinstance(el.tag, str) else ""
+        if (el.get("id") or "").strip().lower() == "fleet":
+            start = i
+            break
+        if tag in ("h2", "h3"):
+            txt = (el.text_content() or "").strip().lower()
+            if txt == "fleet" or txt.startswith("fleet "):
+                start = i
+                break
+    if start is None:
+        return None
+    for el in els[start + 1:]:
+        tag = el.tag if isinstance(el.tag, str) else ""
+        if tag == "h2":                      # next top-level section: stop before it
+            break
+        if tag == "table":
+            try:
+                return LH.tostring(el, encoding="unicode")
+            except Exception:
+                return None
+    return None
 
 
 def _wiki_url(name):
@@ -1105,36 +1130,66 @@ def _resolve_wiki_title(query):
     return None
 
 
-def _try_scrape(url):
+def _read_tables(html):
+    try:
+        return pd.read_html(io.StringIO(html))
+    except Exception:
+        return []
+
+
+def _get(url):
     resp = requests.get(url, headers=WIKI_HEADERS, timeout=10)
-    if resp.status_code != 200:
-        return None
-    tables = pd.read_html(io.StringIO(resp.text))
-    df, total, flagged = parse_fleet(tables)
-    if df is None:
-        return None
-    return {"ok": True, "df": df, "total": total, "url": url, "flagged": flagged}
+    return resp.text if resp.status_code == 200 else None
 
 
 def scrape_fleet(candidates):
-    primary = _wiki_url(candidates[0]) if candidates else "https://en.wikipedia.org/"
+    """Dedicated _fleet page -> main-page Fleet-section table -> opensearch fallback."""
+    primary = (_wiki_url(candidates[0]) + "_fleet") if candidates else "https://en.wikipedia.org/"
+
+    # 1) dedicated "<Airline>_fleet" pages (scan tables, strict validator rejects non-fleet)
     for nm in candidates:
+        url = _wiki_url(nm) + "_fleet"
         try:
-            res = _try_scrape(_wiki_url(nm))
-            if res:
-                return res
+            html = _get(url)
+            if html:
+                df, total, flagged = parse_fleet(_read_tables(html))
+                if df is not None:
+                    return {"ok": True, "df": df, "total": total, "url": url, "flagged": flagged}
         except Exception:
-            continue
-    for nm in candidates:                      # opensearch fallback (resolves real title)
-        resolved = _resolve_wiki_title(nm)
-        if resolved:
+            pass
+
+    # 2) main page: ONLY the table that follows the "Fleet" heading (no indiscriminate scan)
+    for nm in candidates:
+        url = _wiki_url(nm)
+        try:
+            html = _get(url)
+            if html:
+                frag = _table_after_fleet_heading(html)
+                if frag:
+                    df, total, flagged = parse_fleet(_read_tables(frag))
+                    if df is not None:
+                        return {"ok": True, "df": df, "total": total, "url": url, "flagged": flagged}
+        except Exception:
+            pass
+
+    # 3) opensearch fallback: resolve a real article for "<name> fleet" then "<name>"
+    if candidates:
+        for q in (candidates[0] + " fleet", candidates[0]):
+            resolved = _resolve_wiki_title(q)
+            if not resolved:
+                continue
             try:
-                res = _try_scrape(resolved)
-                if res:
-                    return res
+                html = _get(resolved)
+                if not html:
+                    continue
+                frag = _table_after_fleet_heading(html)
+                tables = _read_tables(frag) if frag else _read_tables(html)
+                df, total, flagged = parse_fleet(tables)
+                if df is not None:
+                    return {"ok": True, "df": df, "total": total, "url": resolved, "flagged": flagged}
             except Exception:
                 pass
-            break
+
     return {"ok": False, "url": primary}
 
 
@@ -1489,8 +1544,8 @@ with tab5:
 
         res = fc[name]
         if not res.get("ok"):
-            st.warning(f"Could not parse fleet data for {name}. "
-                       f"View the source page directly: {res.get('url')}")
+            st.warning(f"Could not locate a valid fleet table for {name} on Wikipedia. "
+                       f"View the page directly: {res.get('url')}")
             continue
 
         df = res["df"]
