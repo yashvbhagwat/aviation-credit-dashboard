@@ -6,7 +6,9 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from datetime import date
 import io
+import re
 import statistics
+import requests
 import yfinance as yf
 
 st.set_page_config(
@@ -964,8 +966,180 @@ st.download_button(
 )
 
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Credit Summary", "Trends", "Peer Ranking", "Financial Statements"
+# ----------------------------------------------------------------------------
+# Fleet Composition engine (live Wikipedia scrape)
+# ----------------------------------------------------------------------------
+WIKI_HEADERS = {"User-Agent": "Mozilla/5.0 (Aviation Finance Dashboard)"}
+TICKER_TO_SUGGESTION = {v: k for k, v in AIRLINE_SUGGESTIONS.items()}
+AC_HINTS = ("boeing", "airbus", "atr", "embraer", "bombardier", "mcdonnell",
+            "de havilland", "comac", "cessna", "saab", "fokker", "sukhoi", "antonov")
+
+
+def _clean_text(x):
+    s = re.sub(r"\[[^\]]*\]", "", str(x))      # footnote markers [1], [a]
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _to_count(x):
+    s = re.sub(r"\[[^\]]*\]", "", str(x)).replace(",", "")
+    m = re.search(r"-?\d+", s)
+    return (int(m.group()), False) if m else (0, True)
+
+
+def _norm_cols(df):
+    cols = []
+    for c in df.columns:
+        if isinstance(c, tuple):
+            c = " ".join(str(p) for p in c if str(p) != "nan")
+        cols.append(_clean_text(c).lower())
+    return cols
+
+
+def _identify_fleet_cols(df):
+    if df.shape[1] < 2:
+        return None
+    cols = _norm_cols(df)
+    ac_idx = None
+    for i, h in enumerate(cols):
+        if "aircraft" in h or h == "type" or h.endswith(" type"):
+            ac_idx = i
+            break
+    if ac_idx is None:
+        first = df.iloc[:, 0].astype(str).str.lower()
+        if first.str.contains("|".join(AC_HINTS), regex=True).any():
+            ac_idx = 0
+    if ac_idx is None:
+        return None
+    # count column: prefer a header naming in-service/fleet/active, never "orders"
+    cnt_idx = None
+    for i, h in enumerate(cols):
+        if i == ac_idx or "order" in h:
+            continue
+        if any(k in h for k in ("in service", "service", "in fleet", "fleet",
+                                "active", "in operation", "operation", "operated")):
+            cnt_idx = i
+            break
+    if cnt_idx is None:
+        best, best_frac = None, 0.0
+        for i in range(df.shape[1]):
+            if i == ac_idx:
+                continue
+            parsed = [_to_count(v) for v in df.iloc[:, i]]
+            frac = sum(1 for v, flag in parsed if not flag and v > 0) / max(1, len(parsed))
+            if frac > best_frac:
+                best, best_frac = i, frac
+        if best is not None and best_frac >= 0.5:
+            cnt_idx = best
+    if cnt_idx is None:
+        return None
+    return ac_idx, cnt_idx
+
+
+def _extract_fleet_rows(df, ac_idx, cnt_idx):
+    rows, flagged = [], False
+    for _, r in df.iterrows():
+        ac = _clean_text(r.iloc[ac_idx])
+        if not ac or ac.lower() == "nan":
+            continue
+        if "total" in ac.lower():
+            continue
+        cnt, flag = _to_count(r.iloc[cnt_idx])
+        flagged = flagged or flag
+        rows.append((ac, cnt))
+    return rows, flagged
+
+
+def parse_fleet(tables):
+    """Return (DataFrame|None, total, flagged). Picks the first plausible fleet table."""
+    for df in tables:
+        ident = _identify_fleet_cols(df)
+        if not ident:
+            continue
+        ac_idx, cnt_idx = ident
+        rows, flagged = _extract_fleet_rows(df, ac_idx, cnt_idx)
+        if len(rows) >= 2 and any(c > 0 for _, c in rows):
+            out = pd.DataFrame(rows, columns=["Aircraft Type", "In Service"])
+            out = out.sort_values("In Service", ascending=False).reset_index(drop=True)
+            return out, int(out["In Service"].sum()), flagged
+    return None, 0, False
+
+
+def _wiki_url(name):
+    return "https://en.wikipedia.org/wiki/" + name.replace(" ", "_")
+
+
+def fleet_name_candidates(display_name, ticker):
+    cands = []
+    sug = TICKER_TO_SUGGESTION.get(ticker)
+    for nm in (sug, display_name):
+        if nm:
+            cands.append(re.sub(r"\s*\(.*?\)", "", nm).strip())
+    if display_name:
+        cleaned = re.sub(
+            r",?\s*(Inc\.?|Incorporated|Corporation|Corp\.?|plc|PLC|Holdings|Company|"
+            r"Co\.?|Group|Ltd\.?|Limited|S\.A\.?|AG|N\.V\.?)\b.*$", "", display_name).strip()
+        if cleaned:
+            cands.append(cleaned)
+    seen, out = set(), []
+    for c in cands:
+        if c and c.lower() not in seen:
+            seen.add(c.lower())
+            out.append(c)
+    return out
+
+
+def _resolve_wiki_title(query):
+    try:
+        r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "opensearch", "search": query, "limit": 1,
+                    "namespace": 0, "format": "json"},
+            headers=WIKI_HEADERS, timeout=10)
+        data = r.json()
+        if isinstance(data, list) and len(data) >= 4 and data[3]:
+            return data[3][0]
+        if isinstance(data, list) and len(data) >= 2 and data[1]:
+            return _wiki_url(data[1][0])
+    except Exception:
+        return None
+    return None
+
+
+def _try_scrape(url):
+    resp = requests.get(url, headers=WIKI_HEADERS, timeout=10)
+    if resp.status_code != 200:
+        return None
+    tables = pd.read_html(io.StringIO(resp.text))
+    df, total, flagged = parse_fleet(tables)
+    if df is None:
+        return None
+    return {"ok": True, "df": df, "total": total, "url": url, "flagged": flagged}
+
+
+def scrape_fleet(candidates):
+    primary = _wiki_url(candidates[0]) if candidates else "https://en.wikipedia.org/"
+    for nm in candidates:
+        try:
+            res = _try_scrape(_wiki_url(nm))
+            if res:
+                return res
+        except Exception:
+            continue
+    for nm in candidates:                      # opensearch fallback (resolves real title)
+        resolved = _resolve_wiki_title(nm)
+        if resolved:
+            try:
+                res = _try_scrape(resolved)
+                if res:
+                    return res
+            except Exception:
+                pass
+            break
+    return {"ok": False, "url": primary}
+
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Credit Summary", "Trends", "Peer Ranking", "Financial Statements", "Fleet Composition"
 ])
 
 
@@ -1279,5 +1453,57 @@ with tab4:
         else:
             st.info("No cash flow data available.")
 
+
+# ----------------------------------------------------------------------------
+# TAB 5 \u2014 Fleet Composition (live Wikipedia scrape)
+# ----------------------------------------------------------------------------
+with tab5:
+    st.subheader("Fleet Composition")
+    st.caption(
+        "Fleet data is scraped live from Wikipedia at the time of loading. Accuracy depends "
+        "on how recently each airline's Wikipedia page was updated by its editors. For "
+        "mission-critical decisions, verify against the airline's official investor disclosures."
+    )
+
+    if "fleet_cache" not in st.session_state:
+        st.session_state.fleet_cache = {}
+    fc = st.session_state.fleet_cache
+
+    for name in airlines:
+        ticker = data[name]["ticker"]
+        st.markdown("---")
+        hc1, hc2 = st.columns([5, 1])
+        hc1.markdown(f"### {name} \u2014 Fleet Composition")
+        if hc2.button("Refresh Fleet Data", key=f"fleet_refresh_{ticker}"):
+            fc.pop(name, None)
+            st.rerun()
+
+        if name not in fc:
+            cands = fleet_name_candidates(name, ticker)
+            with st.spinner(f"Scraping fleet data for {name} ..."):
+                try:
+                    fc[name] = scrape_fleet(cands)
+                except Exception:
+                    fc[name] = {"ok": False,
+                                "url": _wiki_url(cands[0]) if cands else "https://en.wikipedia.org/"}
+
+        res = fc[name]
+        if not res.get("ok"):
+            st.warning(f"Could not parse fleet data for {name}. "
+                       f"View the source page directly: {res.get('url')}")
+            continue
+
+        df = res["df"]
+        st.caption(f"Source: Wikipedia (scraped live) | Total Aircraft: {res['total']}")
+        if res.get("flagged"):
+            st.caption("\u26a0 Some rows had non-numeric counts that were set to 0 \u2014 "
+                       "verify those against the source page.")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        fig = px.bar(df.sort_values("In Service"), x="In Service", y="Aircraft Type",
+                     orientation="h")
+        fig.update_layout(height=max(240, 40 + 28 * len(df)),
+                          margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
 
 # To run: streamlit run app.py
