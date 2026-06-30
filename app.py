@@ -1193,8 +1193,88 @@ def scrape_fleet(candidates):
     return {"ok": False, "url": primary}
 
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Credit Summary", "Trends", "Peer Ranking", "Financial Statements", "Fleet Composition"
+# ----------------------------------------------------------------------------
+# Reverse DCF helpers
+# ----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_risk_free():
+    """10Y Treasury yield (^TNX quotes in percent) as a decimal, or None."""
+    try:
+        h = yf.Ticker("^TNX").history(period="1d")
+        return float(h["Close"].iloc[-1]) / 100.0
+    except Exception:
+        return None
+
+
+def _effective_tax_rate(bundle):
+    """Avg of yearly (tax / pretax) over up to 3 FYs, excluding loss years.
+    Returns (rate, used_fallback). Clipped to [0, 0.35]; 0.21 fallback otherwise."""
+    inc = bundle.get("fin")
+    tax = _year_map(inc, "Tax Provision")
+    pre = _year_map(inc, "Pretax Income")
+    years = sorted(set(tax) & set(pre), reverse=True)[:3]
+    rates = [tax[y] / pre[y] for y in years
+             if tax.get(y) is not None and pre.get(y) is not None and pre[y] > 0]
+    if not rates:
+        return 0.21, True
+    avg = sum(rates) / len(rates)
+    if avg < 0.0 or avg > 0.35:
+        return 0.21, True
+    return avg, False
+
+
+def _ttm_fcf(bundle):
+    """TTM unlevered-FCF proxy = sum(OCF) + sum(CapEx) over up to 4 latest quarters.
+    Returns (ttm_value_or_None, n_quarters_used)."""
+    qcf = bundle.get("qcf")
+    if qcf is None or qcf.empty:
+        return None, 0
+    ocf_idx = _yf_find(qcf, "Operating Cash Flow")
+    cap_idx = _yf_find(qcf, "Capital Expenditure")
+    if ocf_idx is None:
+        return None, 0
+    ocf_sum, cap_sum, n = 0.0, 0.0, 0
+    for c in list(qcf.columns)[:4]:
+        try:
+            v = qcf.loc[ocf_idx, c]
+        except Exception:
+            continue
+        if pd.isna(v):
+            continue
+        ocf_sum += float(v)
+        n += 1
+        if cap_idx is not None:
+            try:
+                cv = qcf.loc[cap_idx, c]
+                if not pd.isna(cv):
+                    cap_sum += float(cv)
+            except Exception:
+                pass
+    if n == 0:
+        return None, 0
+    ttm = ocf_sum + (cap_sum if cap_sum <= 0 else -cap_sum)
+    return ttm, n
+
+
+def _money(v):
+    if v is None:
+        return "\u2014"
+    a = abs(v)
+    sign = "-" if v < 0 else ""
+    if a >= 1e9:
+        return f"{sign}${a / 1e9:.1f}B"
+    if a >= 1e6:
+        return f"{sign}${a / 1e6:.1f}M"
+    return f"{sign}${a:,.0f}"
+
+
+def _pct(x):
+    return "\u2014" if x is None else f"{x * 100:.2f}%"
+
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "Credit Summary", "Trends", "Peer Ranking", "Financial Statements",
+    "Fleet Composition", "Reverse DCF"
 ])
 
 
@@ -1560,5 +1640,164 @@ with tab5:
         fig.update_layout(height=max(240, 40 + 28 * len(df)),
                           margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
+
+# ----------------------------------------------------------------------------
+# TAB 6 \u2014 Reverse DCF
+# ----------------------------------------------------------------------------
+with tab6:
+    st.subheader("Reverse DCF")
+    st.caption("Solves for the Year-0 unlevered FCF implied by each airline's current "
+               "enterprise value, using a live-recalculating WACC.")
+
+    G = 0.03  # terminal growth rate (assumed)
+    rf = fetch_risk_free()
+
+    if rf is None:
+        st.error("Could not fetch current Treasury yield. Reverse DCF unavailable.")
+    else:
+        st.caption(f"Risk-free rate (10Y Treasury, ^TNX): {_pct(rf)} \u00b7 "
+                   "Terminal growth rate (assumed, approximates long-run U.S. GDP growth): 3.0%")
+        for name in airlines:
+            ticker = data[name]["ticker"]
+            st.divider()
+            st.markdown(f"### {name} ({ticker}) \u2014 Reverse DCF Analysis")
+            try:
+                bundle = data[name].get("bundle", {})
+                info = bundle.get("info") or {}
+                recs = data[name]["records"]
+                rec = recs[-1] if recs else None
+
+                beta = info.get("beta")
+                market_cap = info.get("marketCap")
+                total_debt = rec["total_debt"] if rec else None
+                cash = (rec["cash"] if rec else None) or 0.0
+                interest = rec["interest_expense"] if rec else None
+                M = extract_yf_financials(bundle)
+                sti = (M.get("sti", {}).get(rec["fy"]) if rec else 0) or 0.0
+
+                if beta is None:
+                    st.info(f"Beta unavailable for {name} \u2014 Reverse DCF cannot be calculated.")
+                    continue
+                if market_cap is None:
+                    st.info(f"Market cap unavailable for {name} \u2014 Reverse DCF cannot be calculated.")
+                    continue
+                if not total_debt or total_debt <= 0:
+                    st.info(f"Insufficient debt data for {name} \u2014 Reverse DCF cannot be calculated.")
+                    continue
+                if interest is None:
+                    st.info(f"Insufficient debt-cost data for {name} \u2014 Reverse DCF cannot be calculated.")
+                    continue
+
+                erp = st.slider(f"Equity Risk Premium \u2014 {name}", min_value=3.0, max_value=8.0,
+                                value=5.0, step=0.1, format="%.1f%%", key=f"erp_{ticker}") / 100.0
+
+                cost_of_equity = rf + beta * erp
+                cost_of_debt = interest / total_debt
+                tax_rate, tax_fallback = _effective_tax_rate(bundle)
+                after_tax_cod = cost_of_debt * (1 - tax_rate)
+                total_capital = market_cap + total_debt
+                w_e = market_cap / total_capital
+                w_d = total_debt / total_capital
+                wacc = w_e * cost_of_equity + w_d * after_tax_cod
+
+                if wacc <= G + 0.005:
+                    st.warning(f"WACC is too close to or below the terminal growth rate for {name} "
+                               "given current assumptions. Try increasing the Equity Risk Premium.")
+                    continue
+
+                # EV per dollar of Year-0 FCF. Matches the spec's derivation
+                # EV = FCF0*(1+g)/(WACC-g)  =>  multiplier = (1+g)/(WACC-g).
+                # (The spec's formula line read (1+wacc); to use that instead,
+                #  replace (1 + G) with (1 + wacc) below.)
+                multiplier = (1 + G) / (wacc - G)
+
+                current_ev = market_cap + total_debt - cash - sti
+                implied_fcf = current_ev / multiplier
+                ttm_fcf, nq = _ttm_fcf(bundle)
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Implied Required FCF", _money(implied_fcf))
+                ttm_label = "Actual TTM FCF" if nq >= 4 else f"Actual FCF ({nq}Q)"
+                if ttm_fcf is None:
+                    c2.metric(ttm_label, "\u2014")
+                else:
+                    c2.metric(ttm_label, _money(ttm_fcf))
+                if ttm_fcf is not None and implied_fcf not in (None, 0):
+                    gap = ttm_fcf - implied_fcf
+                    gap_pct = gap / abs(implied_fcf) * 100
+                    c3.metric("Gap (Actual \u2212 Implied)", _money(gap), delta=f"{gap_pct:+.1f}%")
+                else:
+                    c3.metric("Gap (Actual \u2212 Implied)", "\u2014")
+
+                if nq and nq < 4:
+                    st.caption(f"TTM based on {nq} quarter(s) (limited data available).")
+
+                if ttm_fcf is None:
+                    st.info("Actual TTM FCF unavailable (no quarterly cash-flow data) \u2014 "
+                            "showing implied requirement only.")
+                elif ttm_fcf >= implied_fcf:
+                    st.success(f"Current cash generation supports the stock price. {name}'s trailing "
+                               f"FCF of {_money(ttm_fcf)} meets or exceeds the {_money(implied_fcf)} "
+                               "required by current market pricing.")
+                else:
+                    gap_pct = (implied_fcf - ttm_fcf) / abs(implied_fcf) * 100
+                    st.warning(f"Stock price implies cash generation beyond current run-rate. The "
+                               f"market is pricing in {gap_pct:.1f}% more unlevered FCF than {name} "
+                               "is currently generating (TTM basis).")
+
+                with st.expander(f"View WACC & DCF Assumptions \u2014 {name}", expanded=False):
+                    tax_note = " (fallback 21% statutory rate used)" if tax_fallback else ""
+                    rows = [
+                        ("MARKET INPUTS", ""),
+                        ("Risk-Free Rate (10Y Treasury)", _pct(rf)),
+                        ("Beta", f"{beta:.2f}"),
+                        ("Equity Risk Premium", _pct(erp)),
+                        ("\u2192 Cost of Equity", _pct(cost_of_equity)),
+                        ("DEBT INPUTS", ""),
+                        ("Interest Expense (latest FY)", _money(interest)),
+                        ("Total Debt (incl. leases)", _money(total_debt)),
+                        ("Cost of Debt", _pct(cost_of_debt)),
+                        ("Effective Tax Rate", _pct(tax_rate) + tax_note),
+                        ("\u2192 After-Tax Cost of Debt", _pct(after_tax_cod)),
+                        ("CAPITAL STRUCTURE", ""),
+                        ("Market Cap", _money(market_cap)),
+                        ("Total Debt", _money(total_debt)),
+                        ("Weight of Equity", f"{w_e * 100:.1f}%"),
+                        ("Weight of Debt", f"{w_d * 100:.1f}%"),
+                        ("\u2192 WACC", _pct(wacc)),
+                        ("TERMINAL VALUE ASSUMPTIONS", ""),
+                        ("Terminal Growth Rate", "3.0% (fixed assumption)"),
+                        ("EV/FCF Multiplier", f"{multiplier:.1f}x"),
+                        ("VALUATION BRIDGE", ""),
+                        ("Current Market Cap", _money(market_cap)),
+                        ("Plus Total Debt", _money(total_debt)),
+                        ("Less Cash & STI", _money(cash + sti)),
+                        ("= Current Enterprise Value", _money(current_ev)),
+                        ("\u00f7 EV/FCF Multiplier", f"{multiplier:.1f}x"),
+                        ("= Implied Required FCF", _money(implied_fcf)),
+                    ]
+                    html = ["<table style='width:100%;border-collapse:collapse;font-size:13px;'>"]
+                    for label, val in rows:
+                        if val == "":
+                            html.append(
+                                f"<tr><td colspan='2' style='background:#1e293b;color:#fff;"
+                                f"font-weight:700;padding:5px 10px;letter-spacing:.04em;'>{label}</td></tr>")
+                        else:
+                            html.append(
+                                f"<tr style='border-bottom:1px solid #f1f5f9;'>"
+                                f"<td style='padding:4px 10px;'>{label}</td>"
+                                f"<td style='padding:4px 10px;text-align:right;font-weight:600;'>{val}</td></tr>")
+                    html.append("</table>")
+                    st.markdown("".join(html), unsafe_allow_html=True)
+                    st.caption(
+                        "This is a simplified single-stage reverse DCF assuming constant terminal "
+                        "growth from Year 0. It does not model a multi-year explicit growth ramp. "
+                        "WACC recalculates live based on current market data (Treasury yield, beta, "
+                        "market cap) each time this page loads, so figures will shift slightly between "
+                        "visits even without company-specific news \u2014 this reflects real-time market "
+                        "conditions, not a calculation error. Note: the implied figure is unlevered "
+                        "while the TTM actual (OCF + CapEx) is a levered proxy, so the gap is indicative.")
+            except Exception as exc:
+                st.warning(f"Reverse DCF could not be completed for {name}: {exc}")
 
 # To run: streamlit run app.py
