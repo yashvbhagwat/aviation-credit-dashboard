@@ -1,12 +1,10 @@
 import streamlit as st
-import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 from datetime import date
-import json
 import io
 import statistics
 import yfinance as yf
@@ -16,28 +14,6 @@ st.set_page_config(
     page_icon="\u2708",
     layout="wide",
 )
-
-AIRLINES = {
-    "Delta Air Lines": {"ticker": "DAL", "cik": "0000027904"},
-    "United Airlines Holdings": {"ticker": "UAL", "cik": "0000100517"},
-    "American Airlines Group": {"ticker": "AAL", "cik": "0001549922"},
-    "Southwest Airlines": {"ticker": "LUV", "cik": "0000092380"},
-    "Alaska Air Group": {"ticker": "ALK", "cik": "0000766421"},
-    "JetBlue Airways": {"ticker": "JBLU", "cik": "0001158463"},
-    "Allegiant Travel Company": {"ticker": "ALGT", "cik": "0001362988"},
-    "Frontier Group Holdings": {"ticker": "ULCC", "cik": "0001836035"},
-    "Spirit Airlines": {"ticker": "SAVE", "cik": "0001418121"},
-    "Sun Country Airlines": {"ticker": "SNCY", "cik": "0001549802"},
-    "Hawaiian Holdings": {"ticker": "HA", "cik": "0000046619"},
-    "SkyWest Inc": {"ticker": "SKYW", "cik": "0000070858"},
-    "Air Transport Services Group": {"ticker": "ATSG", "cik": "0000894871"},
-    "Mesa Air Group": {"ticker": "MESA", "cik": "0000810332"},
-}
-
-SEC_HEADERS = {
-    "User-Agent": "Aviation Credit Tool aviationcredit@gmail.com",
-    "Accept": "application/json",
-}
 
 # RAG hex colors
 GREEN_BG, GREEN_TEXT = "#f0fdf4", "#15803d"
@@ -52,29 +28,26 @@ COLOR_MAP = {
     "nm": (NM_BG, NM_TEXT),
 }
 
-INSTANT = "instant"
-DURATION = "duration"
-
-# concept_key: (list_of_xbrl_concepts_in_priority_order, kind)
-CONCEPTS = {
-    "revenue": (["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"], DURATION),
-    "assets_current": (["AssetsCurrent"], INSTANT),
-    "liabilities_current": (["LiabilitiesCurrent"], INSTANT),
-    "cash": (["CashAndCashEquivalentsAtCarryingValue"], INSTANT),
-    "short_term_investments": (["ShortTermInvestments", "AvailableForSaleSecuritiesCurrent"], INSTANT),
-    "assets_total": (["Assets"], INSTANT),
-    "debt_current": (["DebtCurrent", "LongTermDebtCurrent"], INSTANT),
-    "debt_noncurrent": (["LongTermDebtNoncurrent", "LongTermDebt"], INSTANT),
-    "op_lease_current": (["OperatingLeaseLiabilityCurrent"], INSTANT),
-    "op_lease_noncurrent": (["OperatingLeaseLiabilityNoncurrent"], INSTANT),
-    "equity": (["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"], INSTANT),
-    "operating_income": (["OperatingIncomeLoss"], DURATION),
-    "interest_expense": (["InterestExpense", "InterestAndDebtExpense"], DURATION),
-    "da": (["DepreciationDepletionAndAmortization", "DepreciationAndAmortization"], DURATION),
-    "operating_lease_cost": (["OperatingLeaseCost", "LeaseAndRentalExpense"], DURATION),
+AIRLINE_SUGGESTIONS = {
+    "Delta Air Lines": "DAL", "United Airlines Holdings": "UAL",
+    "American Airlines Group": "AAL", "Southwest Airlines": "LUV",
+    "Alaska Air Group": "ALK", "JetBlue Airways": "JBLU",
+    "Allegiant Travel Company": "ALGT", "Frontier Group Holdings": "ULCC",
+    "Spirit Airlines": "SAVE", "Sun Country Airlines": "SNCY",
+    "Hawaiian Holdings": "HA", "SkyWest Inc": "SKYW",
+    "Air Transport Services Group": "ATSG", "Mesa Air Group": "MESA",
+    "Lufthansa Group": "LHA.DE", "Ryanair Holdings": "RYAAY",
+    "International Airlines Group (IAG)": "IAG.L", "Air France-KLM": "AF.PA",
+    "easyJet": "EZJ.L", "Wizz Air Holdings": "WIZZ.L",
+    "Singapore Airlines": "C6L.SI", "Cathay Pacific Airways": "0293.HK",
+    "Air China": "0753.HK", "China Southern Airlines": "1055.HK",
+    "China Eastern Airlines": "0670.HK", "Japan Airlines": "9201.T",
+    "ANA Holdings": "9202.T", "Qantas Airways": "QAN.AX",
+    "Korean Air Lines": "003490.KS", "Turkish Airlines": "THYAO.IS",
+    "Air Canada": "AC.TO", "Copa Holdings": "CPA", "LATAM Airlines": "LTM",
+    "Gol Linhas Aereas": "GOLL4.SA", "Azul": "AZUL",
+    "IndiGo (InterGlobe Aviation)": "INDIGO.NS", "SpiceJet": "SPICEJET.NS",
 }
-
-DEFAULT_ZERO = {"short_term_investments", "debt_current", "op_lease_current", "op_lease_noncurrent"}
 
 # id, label, key, unit_symbol, dimension
 RATIOS = [
@@ -106,218 +79,10 @@ ABS_THRESHOLDS = {
 # threshold used for chart reference lines (the green cutoff)
 GREEN_LINE = {rid: ABS_THRESHOLDS[rid][0] for rid in ABS_THRESHOLDS}
 
-
-# ----------------------------------------------------------------------------
-# Data fetching & extraction
-# ----------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def fetch_companyfacts(cik):
-    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    resp = requests.get(url, headers=SEC_HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-@st.cache_data(show_spinner=False, ttl=900)
-def fetch_stock_info(ticker):
-    """Price + market cap via yfinance. Degrades to None on any failure."""
-    try:
-        info = yf.Ticker(ticker).info or {}
-    except Exception:
-        return {"price": None, "prev": None, "mcap": None}
-    price = info.get("currentPrice") or info.get("regularMarketPrice")
-    return {"price": price, "prev": info.get("previousClose"), "mcap": info.get("marketCap")}
-
-
-def fmt_mcap(m):
-    if m is None:
-        return "\u2014"
-    if m >= 1_000_000_000:
-        return f"${m / 1e9:.1f}B"
-    if m >= 1_000_000:
-        return f"${m / 1e6:.1f}M"
-    return f"${m:,.0f}"
-
-
-def price_line_html(stock):
-    price = stock.get("price")
-    prev = stock.get("prev")
-    mcap = stock.get("mcap")
-    if price is None:
-        return "<span style='color:#9ca3af;'>price unavailable</span>"
-    chg_html = ""
-    if prev:
-        chg = price - prev
-        pct = chg / prev * 100 if prev else 0.0
-        arrow = "\u25b2" if chg >= 0 else "\u25bc"
-        col = GREEN_TEXT if chg >= 0 else RED_TEXT
-        chg_html = f" <span style='color:{col};'>{arrow} {pct:+.1f}%</span>"
-    mcap_html = f" | Mkt Cap: {fmt_mcap(mcap)}" if mcap else ""
-    return f"${price:,.2f}{chg_html}{mcap_html}"
-
-
-def concept_annual(facts_root, concepts, kind):
-    """Return ({fiscal_year_int: value}, matched_concept_or_None).
-
-    Period is derived from the fact's END DATE, not the SEC 'fy' field, because
-    'fy'/'fp' describe the filing the fact came from, not the period it covers.
-    Comparative-period figures inside a later 10-K are therefore mapped to the
-    correct fiscal year. Duration concepts additionally require a ~annual window.
-    """
-    usgaap = facts_root.get("facts", {}).get("us-gaap", {})
-    if not usgaap:
-        usgaap = facts_root.get("us-gaap", {})  # tolerate spec's flatter shape
-    for concept in concepts:
-        node = usgaap.get(concept)
-        if not node:
-            continue
-        units = node.get("units", {})
-        series = units.get("USD")
-        if not series and units:
-            series = next(iter(units.values()))
-        if not series:
-            continue
-        ann = {}
-        for e in series:
-            if e.get("form") != "10-K":
-                continue
-            end = e.get("end")
-            if not end:
-                continue
-            try:
-                end_d = date.fromisoformat(end)
-            except (ValueError, TypeError):
-                continue
-            if kind == DURATION:
-                start = e.get("start")
-                if not start:
-                    continue
-                try:
-                    start_d = date.fromisoformat(start)
-                except (ValueError, TypeError):
-                    continue
-                length = (end_d - start_d).days
-                if length < 350 or length > 380:
-                    continue
-            val = e.get("val")
-            if val is None:
-                continue
-            fy = end_d.year
-            filed = e.get("filed", "")
-            prev = ann.get(fy)
-            if prev is None or filed >= prev[1]:
-                ann[fy] = (val, filed)
-        if ann:
-            return {fy: v[0] for fy, v in ann.items()}, concept
-    return {}, None
-
-
 def safe_div(a, b):
     if a is None or b is None or b == 0:
         return None
     return a / b
-
-
-def compute_records(raw, lease_cost_found):
-    """Build ascending year records with raw $ values, derived metrics, ratios."""
-    anchor = raw.get("assets_total") or raw.get("revenue") or {}
-    years = sorted(anchor.keys(), reverse=True)[:3]
-    years = sorted(years)
-    records = []
-    for y in years:
-        rec = {"fy": y}
-        for key in CONCEPTS:
-            v = raw.get(key, {}).get(y)
-            if v is None and key in DEFAULT_ZERO:
-                v = 0
-            rec[key] = v
-
-        dc = rec["debt_current"] or 0
-        dnc = rec["debt_noncurrent"]
-        olc = rec["op_lease_current"] or 0
-        olnc = rec["op_lease_noncurrent"] or 0
-        total_debt = None if dnc is None else (dc + dnc + olc + olnc)
-
-        cash = rec["cash"]
-        sti = rec["short_term_investments"] or 0
-        net_debt = None if total_debt is None else total_debt - (cash or 0) - sti
-
-        oi = rec["operating_income"]
-        da = rec["da"]
-        ebitda = (oi + da) if (oi is not None and da is not None) else None
-        olcost = rec["operating_lease_cost"]
-        if ebitda is not None and olcost is not None:
-            ebitdar = ebitda + olcost
-        else:
-            ebitdar = ebitda
-
-        ac = rec["assets_current"]
-        lc = rec["liabilities_current"]
-        at = rec["assets_total"]
-        eq = rec["equity"]
-        ie = rec["interest_expense"]
-        rev = rec["revenue"]
-
-        ratios = {}
-        nm = {4: False, 6: False}
-
-        ratios[1] = safe_div(ac, lc)
-        num_quick = None if cash is None else (cash + sti)
-        ratios[2] = safe_div(num_quick, lc)
-        r3 = safe_div(cash, rev)
-        ratios[3] = None if r3 is None else r3 * 100.0
-
-        if ebitdar is None:
-            ratios[4] = None
-        elif ebitdar <= 0:
-            ratios[4] = None
-            nm[4] = True
-        else:
-            ratios[4] = safe_div(net_debt, ebitdar)
-
-        ratios[5] = safe_div(total_debt, at)
-
-        if eq is None:
-            ratios[6] = None
-        elif eq <= 0:
-            ratios[6] = None
-            nm[6] = True
-        else:
-            ratios[6] = safe_div(total_debt, eq)
-
-        ratios[7] = safe_div(oi, ie)
-        ratios[8] = safe_div(ebitdar, ie)
-
-        rec.update({
-            "total_debt": total_debt,
-            "net_debt": net_debt,
-            "ebitda": ebitda,
-            "ebitdar": ebitdar,
-            "ebitdar_label": "EBITDAR" if lease_cost_found else "EBITDA",
-            "ratios": ratios,
-            "nm": nm,
-        })
-        records.append(rec)
-    return records
-
-
-def build_airline(name, info):
-    facts = fetch_companyfacts(info["cik"])
-    raw = {}
-    matched = {}
-    for key, (concepts, kind) in CONCEPTS.items():
-        vals, mc = concept_annual(facts, concepts, kind)
-        raw[key] = vals
-        matched[key] = mc
-    lease_cost_found = matched.get("operating_lease_cost") is not None
-    records = compute_records(raw, lease_cost_found)
-    return {
-        "ticker": info["ticker"],
-        "label": "EBITDAR" if lease_cost_found else "EBITDA",
-        "records": records,
-        "years": [r["fy"] for r in records],
-    }
-
 
 # ----------------------------------------------------------------------------
 # RAG colour resolution
@@ -398,9 +163,6 @@ def resolve_color(rid, records, peers, peer_mode):
     return "nm"
 
 
-# ----------------------------------------------------------------------------
-# Formatting
-# ----------------------------------------------------------------------------
 def fmt_ratio(rid, v):
     if v is None:
         return "N/M"
@@ -415,588 +177,32 @@ def to_millions(v):
         return None
     return v / 1_000_000.0
 
-
-# ----------------------------------------------------------------------------
-# UI: sidebar
-# ----------------------------------------------------------------------------
-st.sidebar.title("\u2708 Airline Selection")
-selected = st.sidebar.multiselect("Select airlines", list(AIRLINES.keys()))
-load = st.sidebar.button("Load Data")
-
-if "data" not in st.session_state:
-    st.session_state.data = {}
-    st.session_state.peer_mode = False
-
-if load:
-    data = {}
-    for name in selected:
-        with st.spinner(f"Fetching {name} ..."):
-            try:
-                data[name] = build_airline(name, AIRLINES[name])
-            except requests.exceptions.RequestException as exc:
-                st.error(f"Request failed for {name}: {exc}")
-                continue
-            except (ValueError, KeyError, json.JSONDecodeError) as exc:
-                st.error(f"Could not parse SEC data for {name}: {exc}")
-                continue
-            data[name]["stock"] = fetch_stock_info(AIRLINES[name]["ticker"])
-    st.session_state.data = data
-
-data = st.session_state.data
-peer_mode = len(data) >= 4
-
-if data:
-    mode_label = "peer comparison" if peer_mode else "absolute thresholds"
-    st.sidebar.success(f"{len(data)} airline(s) loaded \u2014 using {mode_label}.")
-    if not peer_mode:
-        st.sidebar.warning("Peer comparison requires 4+ airlines. Using absolute thresholds.")
-
-    st.sidebar.markdown("---")
-    remove = None
-    for name in list(data.keys()):
-        stock = data[name].get("stock") or {}
-        ticker = data[name]["ticker"]
-        c1, c2 = st.sidebar.columns([6, 1])
-        c1.markdown(
-            f"<div style='line-height:1.3;'>"
-            f"<div style='font-weight:600;font-size:13px;'>{name} "
-            f"<span style='color:#6b7280;'>({ticker})</span></div>"
-            f"<div style='font-size:11px;'>{price_line_html(stock)}</div></div>",
-            unsafe_allow_html=True,
-        )
-        if c2.button("\u00d7", key=f"rm_{name}", help=f"Remove {name}"):
-            remove = name
-    if remove is not None:
-        del st.session_state.data[remove]
-        st.rerun()
-
-    st.sidebar.markdown(
-        "<div style='font-size:10px;color:#9ca3af;font-style:italic;margin-top:6px;'>"
-        "Prices delayed ~15 min. Source: Yahoo Finance</div>",
-        unsafe_allow_html=True,
-    )
+def fmt_mcap(m):
+    if m is None:
+        return "\u2014"
+    if m >= 1_000_000_000:
+        return f"${m / 1e9:.1f}B"
+    if m >= 1_000_000:
+        return f"${m / 1e6:.1f}M"
+    return f"${m:,.0f}"
 
 
-# ----------------------------------------------------------------------------
-# Header
-# ----------------------------------------------------------------------------
-st.title("Aviation Finance Dashboard")
-st.caption("Aircraft Lessor Credit Tool | Data: SEC EDGAR XBRL 10-K")
+def price_line_html(stock):
+    price = stock.get("price")
+    prev = stock.get("prev")
+    mcap = stock.get("mcap")
+    if price is None:
+        return "<span style='color:#9ca3af;'>price unavailable</span>"
+    chg_html = ""
+    if prev:
+        chg = price - prev
+        pct = chg / prev * 100 if prev else 0.0
+        arrow = "\u25b2" if chg >= 0 else "\u25bc"
+        col = GREEN_TEXT if chg >= 0 else RED_TEXT
+        chg_html = f" <span style='color:{col};'>{arrow} {pct:+.1f}%</span>"
+    mcap_html = f" | Mkt Cap: {fmt_mcap(mcap)}" if mcap else ""
+    return f"${price:,.2f}{chg_html}{mcap_html}"
 
-if not data:
-    st.info("Select airlines in the sidebar and click **Load Data** to begin.")
-    st.stop()
-
-# ASC 842 banner if any pre-2020 fiscal year appears
-pre2020 = [n for n, d in data.items() if any(y < 2020 for y in d["years"])]
-if pre2020:
-    st.warning(
-        "ASC 842 (operating lease balance-sheet recognition) took effect for fiscal years "
-        "beginning after 15 Dec 2018. Pre-2020 figures for "
-        + ", ".join(pre2020)
-        + " may not include capitalised operating-lease liabilities and are not strictly comparable."
-    )
-
-airlines = list(data.keys())
-color_seq = px.colors.qualitative.Plotly
-airline_colors = {a: color_seq[i % len(color_seq)] for i, a in enumerate(airlines)}
-
-# precompute latest-year peer arrays per ratio
-peers_latest = {
-    rid: [data[a]["records"][-1]["ratios"].get(rid) if data[a]["records"] else None for a in airlines]
-    for rid, *_ in RATIOS
-}
-
-
-def latest_fy_label():
-    yrs = [d["years"][-1] for d in data.values() if d["years"]]
-    return f"FY{max(yrs)}" if yrs else "Latest FY"
-
-
-# ----------------------------------------------------------------------------
-# Excel export
-# ----------------------------------------------------------------------------
-def openpyxl_fill(color_name):
-    bg, _ = COLOR_MAP[color_name]
-    hexv = bg.replace("#", "")
-    return PatternFill(start_color=hexv, end_color=hexv, fill_type="solid")
-
-
-def build_excel():
-    wb = Workbook()
-    bold = Font(bold=True)
-
-    # Sheet 1: Credit Summary (latest FY) with RAG fills
-    ws = wb.active
-    ws.title = "Credit Summary"
-    ws.cell(row=1, column=1, value="Ratio").font = bold
-    for j, a in enumerate(airlines, start=2):
-        ws.cell(row=1, column=j, value=a).font = bold
-    r = 2
-    last_dim = None
-    for rid, label, key, sym, dim in RATIOS:
-        if dim != last_dim:
-            ws.cell(row=r, column=1, value=dim).font = bold
-            r += 1
-            last_dim = dim
-        ws.cell(row=r, column=1, value=label)
-        for j, a in enumerate(airlines, start=2):
-            recs = data[a]["records"]
-            v = recs[-1]["ratios"].get(rid) if recs else None
-            cell = ws.cell(row=r, column=j, value=fmt_ratio(rid, v))
-            cname = resolve_color(rid, recs, peers_latest[rid], peer_mode)
-            cell.fill = openpyxl_fill(cname)
-            cell.alignment = Alignment(horizontal="center")
-        r += 1
-    ws.column_dimensions["A"].width = 24
-    for j in range(2, 2 + len(airlines)):
-        ws.column_dimensions[ws.cell(row=1, column=j).column_letter].width = 18
-
-    # Sheet 2: 3-Year Trends
-    ws2 = wb.create_sheet("3-Year Trends")
-    headers = ["Airline", "Ticker", "FY"] + [r[1] for r in RATIOS]
-    for j, h in enumerate(headers, start=1):
-        ws2.cell(row=1, column=j, value=h).font = bold
-    row = 2
-    for a in airlines:
-        for rec in data[a]["records"]:
-            ws2.cell(row=row, column=1, value=a)
-            ws2.cell(row=row, column=2, value=data[a]["ticker"])
-            ws2.cell(row=row, column=3, value=f"FY{rec['fy']}")
-            for k, (rid, *_rest) in enumerate(RATIOS, start=4):
-                ws2.cell(row=row, column=k, value=fmt_ratio(rid, rec["ratios"].get(rid)))
-            row += 1
-
-    # Sheet 3: Raw Financials ($M)
-    ws3 = wb.create_sheet("Raw Financials")
-    rawhead = ["Airline", "Ticker", "FY", "Revenue ($M)", "EBITDA(R)", "EBITDA(R) ($M)",
-               "Total Debt ($M)", "Net Debt ($M)", "Cash ($M)", "Total Assets ($M)",
-               "Equity ($M)", "Interest Expense ($M)"]
-    for j, h in enumerate(rawhead, start=1):
-        ws3.cell(row=1, column=j, value=h).font = bold
-    row = 2
-    for a in airlines:
-        for rec in data[a]["records"]:
-            vals = [
-                a, data[a]["ticker"], f"FY{rec['fy']}",
-                to_millions(rec["revenue"]), rec["ebitdar_label"], to_millions(rec["ebitdar"]),
-                to_millions(rec["total_debt"]), to_millions(rec["net_debt"]),
-                to_millions(rec["cash"]), to_millions(rec["assets_total"]),
-                to_millions(rec["equity"]), to_millions(rec["interest_expense"]),
-            ]
-            for j, v in enumerate(vals, start=1):
-                if isinstance(v, float):
-                    ws3.cell(row=row, column=j, value=round(v, 1))
-                else:
-                    ws3.cell(row=row, column=j, value=v)
-            row += 1
-
-    # Sheet 4: Methodology
-    ws4 = wb.create_sheet("Methodology")
-    ws4.column_dimensions["A"].width = 110
-    lines = [
-        "AVIATION FINANCE DASHBOARD \u2014 METHODOLOGY",
-        "",
-        "DATA SOURCE",
-        "All figures sourced from SEC EDGAR XBRL companyfacts (10-K filings).",
-        "Fiscal periods are assigned by each fact's period END DATE (not the SEC 'fy' tag), so",
-        "comparative-period figures inside later filings are mapped to the correct fiscal year.",
-        "",
-        "DERIVED METRICS",
-        "Total Debt = current debt + non-current debt + current op-lease liab + non-current op-lease liab",
-        "Net Debt = Total Debt - Cash - Short-term Investments",
-        "EBITDA = Operating Income + Depreciation & Amortisation",
-        "EBITDAR = EBITDA + Operating Lease Cost (when reported; otherwise EBITDA is used)",
-        "",
-        "RATIOS, LESSOR PURPOSE, AND THRESHOLD RATIONALE",
-        "1. Current Ratio = Current Assets / Current Liabilities",
-        "   Purpose: near-term ability to meet obligations incl. lease rentals. Green >=0.90, Amber 0.60-0.90, Red <0.60.",
-        "2. Quick Ratio = (Cash + Short-term Investments) / Current Liabilities",
-        "   Purpose: liquidity excluding less-liquid current assets. Green >=0.80, Amber 0.50-0.80, Red <0.50.",
-        "3. Cash % Revenue = Cash / Revenue x 100",
-        "   Purpose: liquidity buffer relative to operating scale. Green >=15, Amber 10-15, Red <10.",
-        "4. Net Debt / EBITDAR = Net Debt / EBITDAR",
-        "   Purpose: lease-adjusted leverage \u2014 the core lessor metric. Green <=4.0, Amber 4.0-6.0, Red >6.0.",
-        "5. Total Debt / Assets = Total Debt / Total Assets",
-        "   Purpose: balance-sheet leverage. Green <=0.70, Amber 0.70-0.85, Red >0.85.",
-        "6. Total Debt / Equity = Total Debt / Stockholders' Equity",
-        "   Purpose: leverage vs equity cushion. Green <=3.0, Amber 3.0-5.0, Red >5.0.",
-        "7. Interest Coverage = Operating Income / Interest Expense",
-        "   Purpose: ability to service interest. Green >=2.0, Amber 1.0-2.0, Red <1.0.",
-        "8. EBITDAR Coverage = EBITDAR / Interest Expense",
-        "   Purpose: lease-adjusted earnings vs interest. Green >=3.0, Amber 2.0-3.0, Red <2.0.",
-        "",
-        "EBITDAR vs EBITDA",
-        "EBITDAR adds back operating lease cost to allow comparison across airlines with different",
-        "owned/leased fleet mixes. When operating lease cost is not separately reported, EBITDA is used",
-        "and the metric is labelled accordingly per airline.",
-        "",
-        "N/M TREATMENT",
-        "Net Debt / EBITDAR is Not Meaningful when EBITDAR <= 0 (a leverage multiple over negative",
-        "earnings is uninformative). Total Debt / Equity is Not Meaningful when equity <= 0 (deficit).",
-        "For the latest year, N/M cells are coloured by trend: deteriorating/persistent N/M = Red;",
-        "improving toward positive = Amber. N/M only in prior years is coloured normally on the valid latest year.",
-        "",
-        "ASC 842",
-        "Operating lease liabilities appear on the balance sheet only for fiscal years beginning after",
-        "15 Dec 2018. Pre-2020 figures may understate Total Debt and are not strictly comparable.",
-        "",
-        "PEER COMPARISON RULE",
-        "With 4+ airlines selected, RAG bands use peer median/quartile logic (leverage: below median = green,",
-        "top quartile = red; others: above median = green, bottom quartile = red). With fewer than 4 airlines,",
-        "fixed absolute thresholds are used.",
-        "",
-        "Verify all figures against primary filings before any investment or credit decision.",
-    ]
-    for i, ln in enumerate(lines, start=1):
-        c = ws4.cell(row=i, column=1, value=ln)
-        if ln and ln.isupper() and len(ln) < 60:
-            c.font = bold
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-export_bytes = build_excel()
-st.download_button(
-    "\u2b07 Export to Excel",
-    data=export_bytes,
-    file_name=f"Aviation_Credit_Analysis_{date.today().isoformat()}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
-
-# ----------------------------------------------------------------------------
-# Financial Statements engine
-# ----------------------------------------------------------------------------
-# Row spec tuple: (label, concepts|None, kind, style, neg, direction, calc_key)
-#   style:     line / sub / total / eps
-#   neg:       True -> display as -abs(value)
-#   direction: "up" (higher better), "down" (higher worse), None (neutral)
-#   calc_key:  None for pulled rows; a key handled by the calc dispatcher otherwise
-# NOTE: Many airline line items (fuel, maintenance, air-traffic liability, etc.)
-# are reported as company extension tags rather than standard us-gaap concepts,
-# so those rows will frequently be empty and are hidden when all years are None.
-
-INCOME_SPEC = [
-    ("Total Revenue", ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"], DURATION, "line", False, "up", None),
-    ("Cost of Revenue", ["CostOfRevenue", "CostOfGoodsAndServicesSold"], DURATION, "line", True, "down", None),
-    ("Gross Profit", None, DURATION, "sub", False, "up", "gross_profit"),
-    ("Salaries and Benefits", ["LaborAndRelatedExpense", "EmployeeBenefitsAndShareBasedCompensation"], DURATION, "line", False, "down", None),
-    ("Aircraft Fuel", ["AirlineFuelCosts", "FuelCostsAirline"], DURATION, "line", False, "down", None),
-    ("Depreciation and Amortization", ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization"], DURATION, "line", False, "down", None),
-    ("Maintenance", ["AirlineCapacityPurchaseArrangements", "MaintenanceCostsCivil", "AircraftMaintenanceMaterialsAndRepairs"], DURATION, "line", False, "down", None),
-    ("Other Operating Expenses", ["OtherOperatingIncomeExpenseNet", "OtherCostAndExpenseOperating"], DURATION, "line", False, "down", None),
-    ("Total Operating Expenses", None, DURATION, "sub", False, "down", "total_opex"),
-    ("Operating Income (EBIT)", ["OperatingIncomeLoss"], DURATION, "total", False, "up", None),
-    ("Interest Income", ["InterestIncomeOther", "InvestmentIncomeInterest"], DURATION, "line", False, "up", None),
-    ("Interest Expense", ["InterestExpense", "InterestAndDebtExpense"], DURATION, "line", True, "down", None),
-    ("Other Income/Expense", ["NonoperatingIncomeExpense", "OtherNonoperatingIncomeExpense"], DURATION, "line", False, None, None),
-    ("Income Before Tax", ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"], DURATION, "sub", False, "up", None),
-    ("Income Tax", ["IncomeTaxExpenseBenefit"], DURATION, "line", True, None, None),
-    ("Net Income", ["NetIncomeLoss"], DURATION, "total", False, "up", None),
-    ("EPS Basic", ["EarningsPerShareBasic"], DURATION, "eps", False, "up", None),
-    ("EPS Diluted", ["EarningsPerShareDiluted"], DURATION, "eps", False, "up", None),
-    ("EBITDA (calculated)", None, DURATION, "sub", False, "up", "ebitda"),
-]
-
-BALANCE_SPEC = [
-    ("CURRENT ASSETS", None, INSTANT, "header", False, None, None),
-    ("Cash and Equivalents", ["CashAndCashEquivalentsAtCarryingValue"], INSTANT, "line", False, "up", None),
-    ("Short-term Investments", ["ShortTermInvestments", "AvailableForSaleSecuritiesCurrent"], INSTANT, "line", False, "up", None),
-    ("Accounts Receivable", ["AccountsReceivableNetCurrent", "ReceivablesNetCurrent"], INSTANT, "line", False, None, None),
-    ("Inventories", ["InventoryNet", "AirlineRelatedInventoryNet"], INSTANT, "line", False, None, None),
-    ("Prepaid and Other", ["PrepaidExpenseAndOtherAssetsCurrent"], INSTANT, "line", False, None, None),
-    ("Total Current Assets", ["AssetsCurrent"], INSTANT, "sub", False, "up", None),
-    ("NON-CURRENT ASSETS", None, INSTANT, "header", False, None, None),
-    ("Property Plant and Equipment (net)", ["PropertyPlantAndEquipmentNet"], INSTANT, "line", False, None, None),
-    ("Operating Lease ROU Assets", ["OperatingLeaseRightOfUseAsset"], INSTANT, "line", False, None, None),
-    ("Goodwill", ["Goodwill"], INSTANT, "line", False, None, None),
-    ("Other Non-current Assets", ["OtherAssetsNoncurrent"], INSTANT, "line", False, None, None),
-    ("Total Assets", ["Assets"], INSTANT, "total", False, None, None),
-    ("CURRENT LIABILITIES", None, INSTANT, "header", False, None, None),
-    ("Accounts Payable", ["AccountsPayableCurrent"], INSTANT, "line", False, None, None),
-    ("Accrued Liabilities", ["AccruedLiabilitiesCurrent"], INSTANT, "line", False, None, None),
-    ("Air Traffic Liability", ["AirTrafficLiability", "DeferredRevenueCurrent"], INSTANT, "line", False, None, None),
-    ("Current Debt", ["DebtCurrent", "LongTermDebtCurrent"], INSTANT, "line", False, "down", None),
-    ("Current Operating Lease", ["OperatingLeaseLiabilityCurrent"], INSTANT, "line", False, "down", None),
-    ("Total Current Liabilities", ["LiabilitiesCurrent"], INSTANT, "sub", False, "down", None),
-    ("NON-CURRENT LIABILITIES", None, INSTANT, "header", False, None, None),
-    ("Long-term Debt", ["LongTermDebtNoncurrent", "LongTermDebt"], INSTANT, "line", False, "down", None),
-    ("Non-current Operating Lease", ["OperatingLeaseLiabilityNoncurrent"], INSTANT, "line", False, "down", None),
-    ("Deferred Tax", ["DeferredIncomeTaxLiabilitiesNet", "DeferredTaxLiabilitiesNoncurrent"], INSTANT, "line", False, None, None),
-    ("Other Non-current Liabilities", ["OtherLiabilitiesNoncurrent"], INSTANT, "line", False, None, None),
-    ("Total Liabilities", ["Liabilities"], INSTANT, "total", False, "down", None),
-    ("SHAREHOLDERS EQUITY", None, INSTANT, "header", False, None, None),
-    ("Common Stock", ["CommonStockValue"], INSTANT, "line", False, None, None),
-    ("Additional Paid-in Capital", ["AdditionalPaidInCapital"], INSTANT, "line", False, None, None),
-    ("Retained Earnings", ["RetainedEarningsAccumulatedDeficit"], INSTANT, "line", False, "up", None),
-    ("Treasury Stock", ["TreasuryStockValue"], INSTANT, "line", False, None, None),
-    ("Total Equity", ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"], INSTANT, "total", False, "up", None),
-    ("Total Liabilities and Equity", None, INSTANT, "total", False, None, "total_le"),
-]
-
-CASHFLOW_SPEC = [
-    ("OPERATING ACTIVITIES", None, DURATION, "header", False, None, None),
-    ("Net Income", ["NetIncomeLoss"], DURATION, "line", False, "up", None),
-    ("Depreciation and Amortization", ["DepreciationDepletionAndAmortization"], DURATION, "line", False, None, None),
-    ("Stock-based Compensation", ["ShareBasedCompensation"], DURATION, "line", False, None, None),
-    ("Changes in Working Capital", ["IncreaseDecreaseInOperatingCapital", "IncreaseDecreaseInOperatingLiabilities"], DURATION, "line", False, None, None),
-    ("Other Operating", ["OtherOperatingActivitiesCashFlowStatement"], DURATION, "line", False, None, None),
-    ("Net Cash from Operations", ["NetCashProvidedByUsedInOperatingActivities"], DURATION, "sub", False, "up", None),
-    ("INVESTING ACTIVITIES", None, DURATION, "header", False, None, None),
-    ("Capital Expenditures", ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsForFlightEquipment"], DURATION, "line", True, None, None),
-    ("Purchases of Investments", ["PaymentsToAcquireInvestments", "PaymentsToAcquireAvailableForSaleSecurities"], DURATION, "line", True, None, None),
-    ("Proceeds from Asset Sales", ["ProceedsFromSaleOfPropertyPlantAndEquipment"], DURATION, "line", False, None, None),
-    ("Other Investing", ["PaymentsForProceedsFromOtherInvestingActivities"], DURATION, "line", False, None, None),
-    ("Net Cash from Investing", ["NetCashProvidedByUsedInInvestingActivities"], DURATION, "sub", False, None, None),
-    ("FINANCING ACTIVITIES", None, DURATION, "header", False, None, None),
-    ("Debt Proceeds", ["ProceedsFromIssuanceOfLongTermDebt", "ProceedsFromDebtMaturingInMoreThanThreeMonths"], DURATION, "line", False, None, None),
-    ("Debt Repayments", ["RepaymentsOfLongTermDebt", "RepaymentsOfDebtMaturingInMoreThanThreeMonths"], DURATION, "line", True, None, None),
-    ("Dividends Paid", ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"], DURATION, "line", True, None, None),
-    ("Share Repurchases", ["PaymentsForRepurchaseOfCommonStock"], DURATION, "line", True, None, None),
-    ("Other Financing", ["ProceedsFromRepaymentsOfOtherDebt"], DURATION, "line", False, None, None),
-    ("Net Cash from Financing", ["NetCashProvidedByUsedInFinancingActivities"], DURATION, "sub", False, None, None),
-    ("Net Change in Cash", None, DURATION, "total", False, "up", "net_change"),
-    ("Beginning Cash", None, INSTANT, "line", False, None, "beginning_cash"),
-    ("Ending Cash", ["CashAndCashEquivalentsAtCarryingValue"], INSTANT, "total", False, "up", None),
-]
-
-
-def _pull(facts, concepts, kind):
-    vals, _ = concept_annual(facts, concepts, kind)
-    return vals
-
-
-def _get(vmap, label, fy):
-    d = vmap.get(label)
-    return d.get(fy) if d else None
-
-
-def _calc(stmt, key, vmap, fy, years):
-    if key == "gross_profit":
-        r, c = _get(vmap, "Total Revenue", fy), _get(vmap, "Cost of Revenue", fy)
-        return (r - c) if (r is not None and c is not None) else None
-    if key == "total_opex":
-        comps = ["Salaries and Benefits", "Aircraft Fuel", "Depreciation and Amortization",
-                 "Maintenance", "Other Operating Expenses"]
-        found = [_get(vmap, l, fy) for l in comps]
-        found = [x for x in found if x is not None]
-        return sum(found) if found else None
-    if key == "ebitda":
-        oi, da = _get(vmap, "Operating Income (EBIT)", fy), _get(vmap, "Depreciation and Amortization", fy)
-        return (oi + da) if (oi is not None and da is not None) else None
-    if key == "total_le":
-        tl, te = _get(vmap, "Total Liabilities", fy), _get(vmap, "Total Equity", fy)
-        return (tl + te) if (tl is not None and te is not None) else None
-    if key == "net_change":
-        parts = [_get(vmap, "Net Cash from Operations", fy),
-                 _get(vmap, "Net Cash from Investing", fy),
-                 _get(vmap, "Net Cash from Financing", fy)]
-        parts = [x for x in parts if x is not None]
-        return sum(parts) if parts else None
-    if key == "beginning_cash":
-        return _get(vmap, "Ending Cash", fy - 1)
-    return None
-
-
-def build_statement(facts, years, spec, stmt):
-    vmap = {}
-    for (label, concepts, kind, style, neg, direction, calc_key) in spec:
-        if concepts is not None:
-            vmap[label] = _pull(facts, concepts, kind)
-    for (label, concepts, kind, style, neg, direction, calc_key) in spec:
-        if calc_key is not None:
-            vmap[label] = {fy: _calc(stmt, calc_key, vmap, fy, years) for fy in years}
-    rows = []
-    for (label, concepts, kind, style, neg, direction, calc_key) in spec:
-        if style == "header":
-            rows.append({"label": label, "style": "header", "neg": False,
-                         "dir": None, "vals": {fy: None for fy in years}, "eps": False})
-            continue
-        valdict = vmap.get(label, {})
-        vals = {fy: valdict.get(fy) for fy in years}
-        if all(v is None for v in vals.values()):
-            continue
-        rows.append({"label": label, "style": style, "neg": neg, "dir": direction,
-                     "vals": vals, "eps": style == "eps"})
-    # drop section headers immediately followed by another header or end of list
-    cleaned = []
-    for i, r in enumerate(rows):
-        if r["style"] == "header":
-            nxt = rows[i + 1] if i + 1 < len(rows) else None
-            if nxt is None or nxt["style"] == "header":
-                continue
-        cleaned.append(r)
-    return cleaned, vmap
-
-
-def _pct_change(vals, years):
-    if len(years) < 2:
-        return None
-    a, b = vals.get(years[-2]), vals.get(years[-1])
-    if a is None or a == 0 or b is None:
-        return None
-    return (b - a) / abs(a)
-
-
-def _fmt_value(v, neg, eps):
-    if v is None:
-        return "\u2014", False
-    disp = -abs(v) if neg else v
-    if eps:
-        return f"${disp:,.2f}", disp < 0
-    return f"{disp / 1e6:,.2f}", disp < 0
-
-
-def _pct_text_color(p, direction):
-    if p is None:
-        return "\u2014", NM_TEXT
-    txt = f"{p * 100:+.1f}%"
-    if direction == "up":
-        col = GREEN_TEXT if p > 0 else (RED_TEXT if p < 0 else NM_TEXT)
-    elif direction == "down":
-        col = RED_TEXT if p > 0 else (GREEN_TEXT if p < 0 else NM_TEXT)
-    else:
-        col = NM_TEXT
-    return txt, col
-
-
-ROW_BG = {"sub": "#f3f4f6", "total": "#e5e7eb", "header": "#1e293b"}
-
-
-def render_statement_html(title, rows, years, vmap, is_balance):
-    yr_labels = [f"FY{y}" for y in years]
-    pct_label = f"% Change (FY{years[-2]}\u2192FY{years[-1]})" if len(years) >= 2 else "% Change"
-    head = "".join(f"<th style='text-align:right;padding:6px 10px;'>{h}</th>" for h in yr_labels)
-    html = [
-        f"<div style='font-weight:700;font-size:16px;margin:14px 0 4px;'>{title}</div>",
-        "<table style='width:100%;border-collapse:collapse;font-size:13px;'>",
-        f"<tr style='border-bottom:2px solid #cbd5e1;'>"
-        f"<th style='text-align:left;padding:6px 10px;'>Line Item</th>{head}"
-        f"<th style='text-align:right;padding:6px 10px;'>{pct_label}</th></tr>",
-    ]
-    for r in rows:
-        if r["style"] == "header":
-            html.append(
-                f"<tr><td colspan='{len(years) + 2}' style='background:{ROW_BG['header']};"
-                f"color:#fff;font-weight:700;padding:5px 10px;letter-spacing:.04em;'>"
-                f"{r['label']}</td></tr>"
-            )
-            continue
-        bg = ROW_BG.get(r["style"], "transparent")
-        weight = "700" if r["style"] in ("sub", "total") else "400"
-        cells = ""
-        for y in years:
-            txt, isneg = _fmt_value(r["vals"].get(y), r["neg"], r["eps"])
-            color = RED_TEXT if isneg else "#111827"
-            cells += f"<td style='text-align:right;padding:5px 10px;color:{color};'>{txt}</td>"
-        ptxt, pcol = _pct_text_color(_pct_change(r["vals"], years), r["dir"])
-        html.append(
-            f"<tr style='background:{bg};border-bottom:1px solid #f1f5f9;'>"
-            f"<td style='padding:5px 10px;font-weight:{weight};'>{r['label']}</td>"
-            f"{cells}"
-            f"<td style='text-align:right;padding:5px 10px;color:{pcol};font-weight:{weight};'>{ptxt}</td></tr>"
-        )
-    if is_balance:
-        assets = vmap.get("Total Assets", {})
-        tle = vmap.get("Total Liabilities and Equity", {})
-        chk_cells = ""
-        for y in years:
-            a, le = assets.get(y), tle.get(y)
-            if a is None or le is None or a == 0:
-                chk_cells += "<td style='text-align:right;padding:5px 10px;color:#6b7280;'>\u2014</td>"
-            elif abs(a - le) <= 0.01 * abs(a):
-                chk_cells += f"<td style='text-align:right;padding:5px 10px;color:{GREEN_TEXT};font-weight:700;'>\u2713 Balanced</td>"
-            else:
-                chk_cells += f"<td style='text-align:right;padding:5px 10px;color:{AMBER_TEXT};font-weight:700;'>\u26a0 Check</td>"
-        html.append(
-            f"<tr style='background:{ROW_BG['sub']};'>"
-            f"<td style='padding:5px 10px;font-weight:700;'>Balance Check</td>{chk_cells}"
-            f"<td style='padding:5px 10px;'></td></tr>"
-        )
-    html.append("</table>")
-    return "".join(html)
-
-
-def build_airline_statements_excel(name, ticker, facts, years):
-    wb = Workbook()
-    bold = Font(bold=True)
-    red = Font(color="b91c1c")
-    red_bold = Font(bold=True, color="b91c1c")
-    sub_fill = PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid")
-    total_fill = PatternFill(start_color="E5E7EB", end_color="E5E7EB", fill_type="solid")
-
-    sheets = [
-        ("Income Statement", INCOME_SPEC, "income", False),
-        ("Balance Sheet", BALANCE_SPEC, "balance", True),
-        ("Cash Flow", CASHFLOW_SPEC, "cashflow", False),
-    ]
-    first = True
-    for sheet_name, spec, stmt, is_bal in sheets:
-        rows, vmap = build_statement(facts, years, spec, stmt)
-        ws = wb.active if first else wb.create_sheet(sheet_name)
-        if first:
-            ws.title = sheet_name
-            first = False
-        header = ["Line Item"] + [f"FY{y}" for y in years]
-        header += [f"% Change FY{years[-2]}->FY{years[-1]}" if len(years) >= 2 else "% Change"]
-        for j, h in enumerate(header, start=1):
-            ws.cell(row=1, column=j, value=h).font = bold
-        rownum = 2
-        for r in rows:
-            if r["style"] == "header":
-                c = ws.cell(row=rownum, column=1, value=r["label"])
-                c.font = bold
-                rownum += 1
-                continue
-            is_tot = r["style"] in ("sub", "total")
-            ws.cell(row=rownum, column=1, value=r["label"]).font = bold if is_tot else None
-            for k, y in enumerate(years, start=2):
-                v = r["vals"].get(y)
-                if v is None:
-                    cell = ws.cell(row=rownum, column=k, value=None)
-                else:
-                    disp = -abs(v) if r["neg"] else v
-                    out = round(disp, 2) if r["eps"] else round(disp / 1e6, 2)
-                    cell = ws.cell(row=rownum, column=k, value=out)
-                    if out < 0:
-                        cell.font = red_bold if is_tot else red
-                    elif is_tot:
-                        cell.font = bold
-            p = _pct_change(r["vals"], years)
-            ws.cell(row=rownum, column=len(years) + 2,
-                    value=(f"{p * 100:+.1f}%" if p is not None else None))
-            if is_tot:
-                fill = total_fill if r["style"] == "total" else sub_fill
-                for col in range(1, len(years) + 3):
-                    ws.cell(row=rownum, column=col).fill = fill
-            rownum += 1
-        if is_bal:
-            assets = vmap.get("Total Assets", {})
-            tle = vmap.get("Total Liabilities and Equity", {})
-            ws.cell(row=rownum, column=1, value="Balance Check").font = bold
-            for k, y in enumerate(years, start=2):
-                a, le = assets.get(y), tle.get(y)
-                if a is None or le is None or a == 0:
-                    txt = "\u2014"
-                elif abs(a - le) <= 0.01 * abs(a):
-                    txt = "Balanced"
-                else:
-                    txt = "Check"
-                ws.cell(row=rownum, column=k, value=txt).font = bold
-        ws.column_dimensions["A"].width = 34
-        for k in range(2, len(years) + 3):
-            ws.column_dimensions[ws.cell(row=1, column=k).column_letter].width = 16
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-# ----------------------------------------------------------------------------
 # yfinance financial-statements engine (Financial Statements tab)
 # ----------------------------------------------------------------------------
 # Row spec: (yf_label, display_label, style, special, direction)
@@ -1079,30 +285,6 @@ CASHFLOW_YF = [
 ]
 
 YF_BG = {"bold": "#f8fafc", "sub": "#f1f5f9", "line": "transparent"}
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_yf_statements(ticker):
-    out = {}
-    try:
-        t = yf.Ticker(ticker)
-        getters = {
-            "fin": lambda: t.financials, "bs": lambda: t.balance_sheet, "cf": lambda: t.cashflow,
-            "qfin": lambda: t.quarterly_financials, "qbs": lambda: t.quarterly_balance_sheet,
-            "qcf": lambda: t.quarterly_cashflow,
-        }
-        for k, g in getters.items():
-            try:
-                df = g()
-                out[k] = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-            except Exception:
-                out[k] = pd.DataFrame()
-    except Exception:
-        pass
-    for k in ["fin", "bs", "cf", "qfin", "qbs", "qcf"]:
-        out.setdefault(k, pd.DataFrame())
-    return out
-
 
 def _yf_find(df, yf_label):
     """Resolve a display/yf label to an actual DataFrame index label, or None."""
@@ -1339,10 +521,453 @@ def build_yf_excel(ticker, stmts):
     buf.seek(0)
     return buf.getvalue()
 
+# ----------------------------------------------------------------------------
+# yfinance data layer (single source for all tabs)
+# ----------------------------------------------------------------------------
+YF_ALIASES.update({
+    "long term debt": ["long term debt and capital lease obligation"],
+    "current debt": ["current debt and capital lease obligation",
+                     "current portion of long term debt"],
+    "current assets": ["total current assets"],
+    "current liabilities": ["total current liabilities"],
+    "operating lease liability": ["operating lease liabilities",
+                                  "long term capital lease obligation"],
+    "capital expenditure": ["capital expenditures", "purchase of ppe"],
+    "stockholders equity": ["common stock equity", "total stockholders equity",
+                            "total equity gross minority interest"],
+})
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Credit Summary", "Trends", "Peer Ranking", "Raw Data", "Financial Statements"
+
+@st.cache_data(show_spinner=False, ttl=900)
+def load_ticker_bundle(ticker):
+    b = {"info": {}, "fin": pd.DataFrame(), "bs": pd.DataFrame(), "cf": pd.DataFrame(),
+         "qfin": pd.DataFrame(), "qbs": pd.DataFrame(), "qcf": pd.DataFrame(),
+         "history": pd.DataFrame()}
+    try:
+        t = yf.Ticker(ticker)
+    except Exception:
+        return b
+    try:
+        b["info"] = t.info or {}
+    except Exception:
+        b["info"] = {}
+    getters = {
+        "fin": lambda: t.financials, "bs": lambda: t.balance_sheet, "cf": lambda: t.cashflow,
+        "qfin": lambda: t.quarterly_financials, "qbs": lambda: t.quarterly_balance_sheet,
+        "qcf": lambda: t.quarterly_cashflow, "history": lambda: t.history(period="5y"),
+    }
+    for k, g in getters.items():
+        try:
+            df = g()
+            b[k] = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        except Exception:
+            b[k] = pd.DataFrame()
+    return b
+
+
+def _year_map(df, label):
+    if df is None or getattr(df, "empty", True):
+        return {}
+    idx = _yf_find(df, label)
+    if idx is None:
+        return {}
+    row = df.loc[idx]
+    out = {}
+    for col in df.columns:
+        try:
+            y = col.year
+            v = row[col]
+            out[y] = None if pd.isna(v) else float(v)
+        except Exception:
+            continue
+    return out
+
+
+def extract_yf_financials(bundle):
+    inc, bal, cf = bundle.get("fin"), bundle.get("bs"), bundle.get("cf")
+    return {
+        "revenue": _year_map(inc, "Total Revenue"),
+        "assets_current": _year_map(bal, "Current Assets"),
+        "liabilities_current": _year_map(bal, "Current Liabilities"),
+        "cash": _year_map(bal, "Cash And Cash Equivalents"),
+        "sti": _year_map(bal, "Other Short Term Investments"),
+        "assets_total": _year_map(bal, "Total Assets"),
+        "debt_current": _year_map(bal, "Current Debt"),
+        "debt_noncurrent": _year_map(bal, "Long Term Debt"),
+        "lease_total": _year_map(bal, "Operating Lease Liability"),
+        "equity": _year_map(bal, "Stockholders Equity"),
+        "operating_income": _year_map(inc, "Operating Income"),
+        "interest_expense": _year_map(inc, "Interest Expense"),
+        "da": _year_map(cf, "Depreciation And Amortization"),
+        "op_lease_cost": _year_map(inc, "Rent Expense Supplemental"),
+        "ocf": _year_map(cf, "Operating Cash Flow"),
+        "capex": _year_map(cf, "Capital Expenditure"),
+        "fcf": _year_map(cf, "Free Cash Flow"),
+    }
+
+
+def _ratios_for_year(M, y):
+    g = lambda k: M.get(k, {}).get(y)
+    revenue = g("revenue"); ac = g("assets_current"); lc = g("liabilities_current")
+    cash = g("cash"); sti = g("sti") or 0; at = g("assets_total")
+    dcur = g("debt_current") or 0; dnc = g("debt_noncurrent"); lease = g("lease_total") or 0
+    equity = g("equity"); oi = g("operating_income")
+    ie = g("interest_expense"); ie = abs(ie) if ie is not None else None
+    da = g("da"); olc = g("op_lease_cost")
+    total_debt = None if dnc is None else (dcur + dnc + lease)
+    net_debt = None if total_debt is None else total_debt - (cash or 0) - sti
+    ebitda = (oi + da) if (oi is not None and da is not None) else None
+    if ebitda is not None and olc is not None:
+        ebitdar = ebitda + olc
+        lab = "EBITDAR"
+    else:
+        ebitdar = ebitda
+        lab = "EBITDA"
+    ratios = {}; nm = {4: False, 6: False}
+    ratios[1] = safe_div(ac, lc)
+    qn = None if cash is None else (cash + sti)
+    ratios[2] = safe_div(qn, lc)
+    r3 = safe_div(cash, revenue); ratios[3] = None if r3 is None else r3 * 100
+    if ebitdar is None:
+        ratios[4] = None
+    elif ebitdar <= 0:
+        ratios[4] = None; nm[4] = True
+    else:
+        ratios[4] = safe_div(net_debt, ebitdar)
+    ratios[5] = safe_div(total_debt, at)
+    if equity is None:
+        ratios[6] = None
+    elif equity <= 0:
+        ratios[6] = None; nm[6] = True
+    else:
+        ratios[6] = safe_div(total_debt, equity)
+    ratios[7] = safe_div(oi, ie)
+    ratios[8] = safe_div(ebitdar, ie)
+    return {"fy": y, "ratios": ratios, "nm": nm, "ebitda": ebitda, "ebitdar": ebitdar,
+            "ebitdar_label": lab, "equity": equity, "revenue": revenue,
+            "total_debt": total_debt, "net_debt": net_debt, "cash": cash,
+            "assets_total": at, "interest_expense": ie}
+
+
+def _anchor_years(M):
+    ys = set()
+    for k in ("assets_total", "revenue", "equity", "operating_income"):
+        ys |= set(M.get(k, {}).keys())
+    return sorted(ys)
+
+
+def _fcf_year(M, y):
+    f = M.get("fcf", {}).get(y)
+    if f is not None:
+        return f
+    ocf = M.get("ocf", {}).get(y); capex = M.get("capex", {}).get(y)
+    if ocf is not None and capex is not None:
+        return ocf - abs(capex)
+    return None
+
+
+def build_airline_from_yf(name, ticker, bundle):
+    M = extract_yf_financials(bundle)
+    ay = _anchor_years(M)
+    rec_years = ay[-3:]
+    records = [_ratios_for_year(M, y) for y in rec_years]
+    label = "EBITDAR" if any(M.get("op_lease_cost", {}).get(y) is not None
+                             for y in rec_years) else "EBITDA"
+    series_years = ay[-5:]
+    series = {
+        "years": series_years,
+        "current_ratio": {y: safe_div(M.get("assets_current", {}).get(y),
+                                       M.get("liabilities_current", {}).get(y))
+                          for y in series_years},
+        "revenue": {y: M.get("revenue", {}).get(y) for y in series_years},
+        "ebitdar": {y: _ratios_for_year(M, y)["ebitdar"] for y in series_years},
+        "fcf": {y: _fcf_year(M, y) for y in series_years},
+        "ebitdar_label": label,
+    }
+    pm = None
+    hist = bundle.get("history")
+    if hist is not None and not hist.empty and "Close" in hist.columns:
+        try:
+            s = hist["Close"].resample("ME").last().dropna()
+            if len(s) > 0 and s.iloc[0] not in (0, None):
+                pm = (s / s.iloc[0]) * 100.0
+        except Exception:
+            pm = None
+    info = bundle.get("info") or {}
+    stock = {
+        "price": info.get("currentPrice") or info.get("regularMarketPrice"),
+        "prev": info.get("previousClose"),
+        "mcap": info.get("marketCap"),
+    }
+    return {"ticker": ticker, "label": label, "records": records, "years": rec_years,
+            "series": series, "price_monthly": pm, "stock": stock, "bundle": bundle}
+
+
+def openpyxl_fill(color_name):
+    bg, _ = COLOR_MAP[color_name]
+    hexv = bg.replace("#", "")
+    return PatternFill(start_color=hexv, end_color=hexv, fill_type="solid")
+
+
+def build_excel():
+    wb = Workbook()
+    bold = Font(bold=True)
+
+    # Sheet 1: Credit Summary (latest FY) with RAG fills
+    ws = wb.active
+    ws.title = "Credit Summary"
+    ws.cell(row=1, column=1, value="Ratio").font = bold
+    for j, a in enumerate(airlines, start=2):
+        ws.cell(row=1, column=j, value=a).font = bold
+    r = 2
+    last_dim = None
+    for rid, label, key, sym, dim in RATIOS:
+        if dim != last_dim:
+            ws.cell(row=r, column=1, value=dim).font = bold
+            r += 1
+            last_dim = dim
+        ws.cell(row=r, column=1, value=label)
+        for j, a in enumerate(airlines, start=2):
+            recs = data[a]["records"]
+            v = recs[-1]["ratios"].get(rid) if recs else None
+            cell = ws.cell(row=r, column=j, value=fmt_ratio(rid, v))
+            cname = resolve_color(rid, recs, peers_latest[rid], peer_mode)
+            cell.fill = openpyxl_fill(cname)
+            cell.alignment = Alignment(horizontal="center")
+        r += 1
+    ws.column_dimensions["A"].width = 24
+    for j in range(2, 2 + len(airlines)):
+        ws.column_dimensions[ws.cell(row=1, column=j).column_letter].width = 18
+
+    # Sheet 2: 3-Year Trends
+    ws2 = wb.create_sheet("3-Year Trends")
+    headers = ["Airline", "Ticker", "FY"] + [r[1] for r in RATIOS]
+    for j, h in enumerate(headers, start=1):
+        ws2.cell(row=1, column=j, value=h).font = bold
+    row = 2
+    for a in airlines:
+        for rec in data[a]["records"]:
+            ws2.cell(row=row, column=1, value=a)
+            ws2.cell(row=row, column=2, value=data[a]["ticker"])
+            ws2.cell(row=row, column=3, value=f"FY{rec['fy']}")
+            for k, (rid, *_rest) in enumerate(RATIOS, start=4):
+                ws2.cell(row=row, column=k, value=fmt_ratio(rid, rec["ratios"].get(rid)))
+            row += 1
+
+    # Sheet 3: Raw Financials ($M)
+    ws3 = wb.create_sheet("Raw Financials")
+    rawhead = ["Airline", "Ticker", "FY", "Revenue ($M)", "EBITDA(R)", "EBITDA(R) ($M)",
+               "Total Debt ($M)", "Net Debt ($M)", "Cash ($M)", "Total Assets ($M)",
+               "Equity ($M)", "Interest Expense ($M)"]
+    for j, h in enumerate(rawhead, start=1):
+        ws3.cell(row=1, column=j, value=h).font = bold
+    row = 2
+    for a in airlines:
+        for rec in data[a]["records"]:
+            vals = [
+                a, data[a]["ticker"], f"FY{rec['fy']}",
+                to_millions(rec["revenue"]), rec["ebitdar_label"], to_millions(rec["ebitdar"]),
+                to_millions(rec["total_debt"]), to_millions(rec["net_debt"]),
+                to_millions(rec["cash"]), to_millions(rec["assets_total"]),
+                to_millions(rec["equity"]), to_millions(rec["interest_expense"]),
+            ]
+            for j, v in enumerate(vals, start=1):
+                if isinstance(v, float):
+                    ws3.cell(row=row, column=j, value=round(v, 1))
+                else:
+                    ws3.cell(row=row, column=j, value=v)
+            row += 1
+
+    # Sheet 4: Methodology
+    ws4 = wb.create_sheet("Methodology")
+    ws4.column_dimensions["A"].width = 110
+    lines = [
+        "AVIATION FINANCE DASHBOARD \u2014 METHODOLOGY",
+        "",
+        "DATA SOURCE",
+        "All figures sourced from Yahoo Finance (yfinance) statement data.",
+        "This tool now supports global publicly listed airlines, not limited to U.S. SEC filers.",
+        "Cross-border peer comparisons may mix IFRS and GAAP reporting standards — ratios should",
+        "be interpreted with this in mind when comparing airlines across accounting regimes.",
+        "",
+        "DERIVED METRICS",
+        "Total Debt = current debt + long-term debt + operating lease liability (combined, per yfinance)",
+        "Net Debt = Total Debt - Cash - Short-term Investments",
+        "EBITDA = Operating Income + Depreciation & Amortisation",
+        "EBITDAR = EBITDA + Operating Lease Cost (when reported; otherwise EBITDA is used).",
+        "Note: yfinance rarely exposes lease cost/liability, so most airlines fall back to EBITDA.",
+        "",
+        "RATIOS, LESSOR PURPOSE, AND THRESHOLD RATIONALE",
+        "1. Current Ratio = Current Assets / Current Liabilities",
+        "   Purpose: near-term ability to meet obligations incl. lease rentals. Green >=0.90, Amber 0.60-0.90, Red <0.60.",
+        "2. Quick Ratio = (Cash + Short-term Investments) / Current Liabilities",
+        "   Purpose: liquidity excluding less-liquid current assets. Green >=0.80, Amber 0.50-0.80, Red <0.50.",
+        "3. Cash % Revenue = Cash / Revenue x 100",
+        "   Purpose: liquidity buffer relative to operating scale. Green >=15, Amber 10-15, Red <10.",
+        "4. Net Debt / EBITDAR = Net Debt / EBITDAR",
+        "   Purpose: lease-adjusted leverage \u2014 the core lessor metric. Green <=4.0, Amber 4.0-6.0, Red >6.0.",
+        "5. Total Debt / Assets = Total Debt / Total Assets",
+        "   Purpose: balance-sheet leverage. Green <=0.70, Amber 0.70-0.85, Red >0.85.",
+        "6. Total Debt / Equity = Total Debt / Stockholders' Equity",
+        "   Purpose: leverage vs equity cushion. Green <=3.0, Amber 3.0-5.0, Red >5.0.",
+        "7. Interest Coverage = Operating Income / Interest Expense",
+        "   Purpose: ability to service interest. Green >=2.0, Amber 1.0-2.0, Red <1.0.",
+        "8. EBITDAR Coverage = EBITDAR / Interest Expense",
+        "   Purpose: lease-adjusted earnings vs interest. Green >=3.0, Amber 2.0-3.0, Red <2.0.",
+        "",
+        "EBITDAR vs EBITDA",
+        "EBITDAR adds back operating lease cost to allow comparison across airlines with different",
+        "owned/leased fleet mixes. When operating lease cost is not separately reported, EBITDA is used",
+        "and the metric is labelled accordingly per airline.",
+        "",
+        "N/M TREATMENT",
+        "Net Debt / EBITDAR is Not Meaningful when EBITDAR <= 0 (a leverage multiple over negative",
+        "earnings is uninformative). Total Debt / Equity is Not Meaningful when equity <= 0 (deficit).",
+        "For the latest year, N/M cells are coloured by trend: deteriorating/persistent N/M = Red;",
+        "improving toward positive = Amber. N/M only in prior years is coloured normally on the valid latest year.",
+        "",
+        "PEER COMPARISON RULE",
+        "With 4+ airlines selected, RAG bands use peer median/quartile logic (leverage: below median = green,",
+        "top quartile = red; others: above median = green, bottom quartile = red). With fewer than 4 airlines,",
+        "fixed absolute thresholds are used.",
+        "",
+        "Verify all figures against primary filings before any investment or credit decision.",
+    ]
+    for i, ln in enumerate(lines, start=1):
+        c = ws4.cell(row=i, column=1, value=ln)
+        if ln and ln.isupper() and len(ln) < 60:
+            c.font = bold
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+# ----------------------------------------------------------------------------
+# Sidebar: search + add tickers
+# ----------------------------------------------------------------------------
+st.sidebar.title("\u2708 Airline Selection")
+
+if "data" not in st.session_state:
+    st.session_state.data = {}
+if "add_msg" not in st.session_state:
+    st.session_state.add_msg = None
+
+
+def _add_ticker(ticker, prefer_name=None):
+    ticker = (ticker or "").strip()
+    if not ticker:
+        return
+    up = ticker.upper()
+    for nm, d in st.session_state.data.items():
+        if d.get("ticker") == up:
+            st.session_state.add_msg = ("info", f"{nm} ({up}) is already loaded.")
+            return
+    with st.spinner(f"Fetching {ticker} ..."):
+        bundle = load_ticker_bundle(ticker)
+    info = bundle.get("info") or {}
+    name = info.get("longName") or info.get("shortName") or prefer_name
+    if not name:
+        st.session_state.add_msg = (
+            "error", f"Could not find data for '{ticker}'. Check the ticker symbol and try again.")
+        return
+    st.session_state.data[name] = build_airline_from_yf(name, up, bundle)
+    st.session_state.add_msg = ("success", f"Added {name} ({up}).")
+
+
+query = st.sidebar.text_input("Search company name or ticker", key="search_box")
+if query:
+    q = query.strip().lower()
+    matches = [(n, t) for n, t in AIRLINE_SUGGESTIONS.items()
+               if q in n.lower() or q in t.lower()][:8]
+    for n, t in matches:
+        if st.sidebar.button(f"{n}  ({t})", key=f"sug_{t}", use_container_width=True):
+            _add_ticker(t, prefer_name=n)
+            st.rerun()
+
+if st.sidebar.button("Add Ticker", key="add_btn", use_container_width=True):
+    _add_ticker(query)
+    st.rerun()
+
+if st.session_state.add_msg:
+    kind, msg = st.session_state.add_msg
+    getattr(st.sidebar, kind)(msg)
+    st.session_state.add_msg = None
+
+data = st.session_state.data
+peer_mode = len(data) >= 4
+
+if data:
+    mode_label = "peer comparison" if peer_mode else "absolute thresholds"
+    st.sidebar.success(f"{len(data)} airline(s) loaded \u2014 using {mode_label}.")
+    if not peer_mode:
+        st.sidebar.warning("Peer comparison requires 4+ airlines. Using absolute thresholds.")
+    st.sidebar.markdown("---")
+    remove = None
+    for name in list(data.keys()):
+        stock = data[name].get("stock") or {}
+        ticker = data[name]["ticker"]
+        col1, col2 = st.sidebar.columns([6, 1])
+        col1.markdown(
+            f"<div style='line-height:1.3;'>"
+            f"<div style='font-weight:600;font-size:13px;'>{name} "
+            f"<span style='color:#6b7280;'>({ticker})</span></div>"
+            f"<div style='font-size:11px;'>{price_line_html(stock)}</div></div>",
+            unsafe_allow_html=True,
+        )
+        if col2.button("\u00d7", key=f"rm_{ticker}", help=f"Remove {name}"):
+            remove = name
+    if remove is not None:
+        del st.session_state.data[remove]
+        st.rerun()
+    st.sidebar.markdown(
+        "<div style='font-size:10px;color:#9ca3af;font-style:italic;margin-top:6px;'>"
+        "Prices delayed ~15 min. Source: Yahoo Finance. Financial statement data sourced "
+        "from Yahoo Finance. Reporting standards vary by country (GAAP/IFRS).</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Header
+# ----------------------------------------------------------------------------
+st.title("Aviation Finance Dashboard")
+st.caption("Global Airline Credit & Financials | Data: Yahoo Finance (yfinance)")
+
+if not data:
+    st.info("Search for an airline or type a ticker in the sidebar, then pick a suggestion "
+            "or click **Add Ticker** to begin.")
+    st.stop()
+
+airlines = list(data.keys())
+color_seq = px.colors.qualitative.Plotly
+airline_colors = {a: color_seq[i % len(color_seq)] for i, a in enumerate(airlines)}
+
+peers_latest = {
+    rid: [data[a]["records"][-1]["ratios"].get(rid) if data[a]["records"] else None
+          for a in airlines]
+    for rid, *_ in RATIOS
+}
+
+
+def latest_fy_label():
+    yrs = [d["years"][-1] for d in data.values() if d.get("years")]
+    return f"FY{max(yrs)}" if yrs else "Latest FY"
+
+
+export_bytes = build_excel()
+st.download_button(
+    "\u2b07 Export to Excel",
+    data=export_bytes,
+    file_name=f"Aviation_Finance_Analysis_{date.today().isoformat()}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
+
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Credit Summary", "Trends", "Peer Ranking", "Financial Statements"
 ])
+
 
 # ----------------------------------------------------------------------------
 # TAB 1 \u2014 Credit Summary
@@ -1427,35 +1052,132 @@ with tab1:
                "Colour bands: " + ("peer median/quartile." if peer_mode else "absolute thresholds."))
 
 # ----------------------------------------------------------------------------
-# TAB 2 \u2014 Trends
+# TAB 2 \u2014 Trends (5 charts, single column, up to 5y history)
 # ----------------------------------------------------------------------------
 with tab2:
-    st.subheader("3-Year Trends")
-    grid = st.columns(2)
-    for i, (rid, label, key, sym, dim) in enumerate(RATIOS):
-        rows = []
-        for a in airlines:
-            for rec in data[a]["records"]:
-                rows.append({"Airline": a, "FY": f"FY{rec['fy']}", "Value": rec["ratios"].get(rid)})
-        dfp = pd.DataFrame(rows)
-        with grid[i % 2]:
-            if dfp.empty or dfp["Value"].dropna().empty:
-                st.markdown(f"**{label}**")
-                st.info("No data.")
+    st.subheader("Trends")
+
+    for a in airlines:
+        ys = data[a]["series"]["years"]
+        if ys and len(ys) < 5:
+            st.caption(f"Limited history available for {a} \u2014 showing {len(ys)} year(s).")
+
+    def _fy_order(dfp):
+        return sorted(dfp["FY"].unique())
+
+    # 1) Current Ratio
+    st.markdown("**Current Ratio** \u2014 liquidity vs short-term obligations "
+                "(green dashed line = 0.90 threshold).")
+    rows = []
+    for a in airlines:
+        s = data[a]["series"]
+        for y in s["years"]:
+            rows.append({"Airline": a, "FY": f"FY{y}", "Value": s["current_ratio"].get(y)})
+    dfp = pd.DataFrame(rows)
+    if not dfp.empty and not dfp["Value"].dropna().empty:
+        fig = px.line(dfp, x="FY", y="Value", color="Airline", markers=True,
+                      category_orders={"FY": _fy_order(dfp)}, color_discrete_map=airline_colors)
+        fig.add_hline(y=0.90, line_dash="dash", line_color="#15803d",
+                      annotation_text="0.90", annotation_position="top left")
+        fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="x")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No current-ratio data available.")
+
+    # 2) Revenue Growth %
+    st.markdown("**Revenue Growth %** \u2014 year-over-year change in total revenue "
+                "(0% reference line).")
+    rows = []
+    for a in airlines:
+        s = data[a]["series"]; ys = s["years"]
+        for i, y in enumerate(ys):
+            if i == 0:
                 continue
-            order = sorted(dfp["FY"].unique())
-            fig = px.line(
-                dfp, x="FY", y="Value", color="Airline", markers=True,
-                category_orders={"FY": order}, color_discrete_map=airline_colors,
-                title=label,
-            )
-            fig.add_hline(
-                y=GREEN_LINE[rid], line_dash="dash", line_color="#15803d",
-                annotation_text="green threshold", annotation_position="top left",
-            )
-            fig.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10),
-                              yaxis_title=("%" if sym == "%" else "x"))
-            st.plotly_chart(fig, use_container_width=True)
+            cur = s["revenue"].get(y); prev = s["revenue"].get(ys[i - 1])
+            val = ((cur - prev) / prev * 100) if (cur is not None and prev not in (None, 0)) else None
+            rows.append({"Airline": a, "FY": f"FY{y}", "Value": val})
+    dfp = pd.DataFrame(rows)
+    if not dfp.empty and not dfp["Value"].dropna().empty:
+        fig = px.line(dfp, x="FY", y="Value", color="Airline", markers=True,
+                      category_orders={"FY": _fy_order(dfp)}, color_discrete_map=airline_colors)
+        fig.add_hline(y=0, line_dash="dash", line_color="#6b7280")
+        fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="% YoY")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Not enough history for revenue growth.")
+
+    # 3) EBITDA(R) Growth %
+    st.markdown("**EBITDA(R) Growth %** \u2014 year-over-year change in lease-adjusted earnings "
+                "(0% reference line).")
+    rows = []
+    for a in airlines:
+        s = data[a]["series"]; ys = s["years"]
+        for i, y in enumerate(ys):
+            if i == 0:
+                continue
+            cur = s["ebitdar"].get(y); prev = s["ebitdar"].get(ys[i - 1])
+            val = ((cur - prev) / abs(prev) * 100) if (cur is not None and prev not in (None, 0)) else None
+            rows.append({"Airline": a, "FY": f"FY{y}", "Value": val})
+    dfp = pd.DataFrame(rows)
+    if not dfp.empty and not dfp["Value"].dropna().empty:
+        fig = px.line(dfp, x="FY", y="Value", color="Airline", markers=True,
+                      category_orders={"FY": _fy_order(dfp)}, color_discrete_map=airline_colors)
+        fig.add_hline(y=0, line_dash="dash", line_color="#6b7280")
+        fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="% YoY")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Not enough history for EBITDA(R) growth.")
+
+    # 4) Free Cash Flow (bars, sign-coloured)
+    st.markdown("**Free Cash Flow** \u2014 absolute FCF per year. Bars are in each airline's "
+                "**local reporting currency** (not FX-converted); cross-airline bar heights "
+                "are therefore not directly comparable.")
+    if len(airlines) >= 4:
+        cols = st.columns(2)
+        for idx, a in enumerate(airlines):
+            s = data[a]["series"]
+            xs = [f"FY{y}" for y in s["years"]]
+            vm = [(s["fcf"].get(y) / 1e6 if s["fcf"].get(y) is not None else None) for y in s["years"]]
+            colors = ["#15803d" if (v is not None and v >= 0) else "#b91c1c" for v in vm]
+            fig = go.Figure(go.Bar(x=xs, y=vm, marker_color=colors))
+            fig.add_hline(y=0, line_color="#6b7280")
+            fig.update_layout(title=a, height=260, margin=dict(l=10, r=10, t=30, b=10),
+                              yaxis_title="millions (local)")
+            cols[idx % 2].plotly_chart(fig, use_container_width=True)
+    else:
+        fig = go.Figure()
+        for a in airlines:
+            s = data[a]["series"]
+            xs = [f"FY{y}" for y in s["years"]]
+            vm = [(s["fcf"].get(y) / 1e6 if s["fcf"].get(y) is not None else None) for y in s["years"]]
+            colors = ["#15803d" if (v is not None and v >= 0) else "#b91c1c" for v in vm]
+            fig.add_trace(go.Bar(name=a, x=xs, y=vm, marker_color=colors))
+        fig.add_hline(y=0, line_color="#6b7280")
+        fig.update_layout(barmode="group", height=380, margin=dict(l=10, r=10, t=10, b=10),
+                          yaxis_title="millions (local)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 5) Indexed stock price
+    st.markdown("**Relative Stock Price (indexed to 100)** \u2014 relative performance across airlines.")
+    rows = []
+    for a in airlines:
+        pm = data[a].get("price_monthly")
+        if pm is None or len(pm) == 0:
+            continue
+        for dt, v in pm.items():
+            rows.append({"Airline": a, "Date": dt, "Indexed": float(v)})
+    dfp = pd.DataFrame(rows)
+    if not dfp.empty:
+        fig = px.line(dfp, x="Date", y="Indexed", color="Airline", color_discrete_map=airline_colors)
+        fig.add_hline(y=100, line_dash="dash", line_color="#6b7280", annotation_text="100")
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10),
+                          yaxis_title="Indexed (start = 100)")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Indexed to 100 at start of period. Reflects relative price performance, "
+                   "not absolute returns.")
+    else:
+        st.info("No price history available.")
+
 
 # ----------------------------------------------------------------------------
 # TAB 3 \u2014 Peer Ranking
@@ -1497,64 +1219,26 @@ with tab3:
                 st.plotly_chart(fig, use_container_width=True)
 
 # ----------------------------------------------------------------------------
-# TAB 4 \u2014 Raw Data
+# TAB 4 \u2014 Financial Statements (yfinance; from cached bundle)
 # ----------------------------------------------------------------------------
 with tab4:
-    st.subheader("Raw Financials ($M)")
-    rows = []
-    for a in airlines:
-        for rec in data[a]["records"]:
-            rows.append({
-                "Airline": a,
-                "Ticker": data[a]["ticker"],
-                "FY": f"FY{rec['fy']}",
-                "Revenue ($M)": to_millions(rec["revenue"]),
-                "EBITDA(R)": rec["ebitdar_label"],
-                "EBITDA(R) ($M)": to_millions(rec["ebitdar"]),
-                "Total Debt ($M)": to_millions(rec["total_debt"]),
-                "Net Debt ($M)": to_millions(rec["net_debt"]),
-                "Cash ($M)": to_millions(rec["cash"]),
-                "Total Assets ($M)": to_millions(rec["assets_total"]),
-                "Equity ($M)": to_millions(rec["equity"]),
-                "Interest Expense ($M)": to_millions(rec["interest_expense"]),
-            })
-    raw_df = pd.DataFrame(rows)
-    num_cols = [c for c in raw_df.columns if c.endswith("($M)")]
-
-    def red_negative(v):
-        if isinstance(v, (int, float)) and v < 0:
-            return f"color:{RED_TEXT}"
-        return ""
-
-    styler = (raw_df.style
-              .format({c: "{:,.1f}" for c in num_cols}, na_rep="\u2014")
-              .map(red_negative, subset=num_cols))
-    st.dataframe(styler, use_container_width=True)
-    st.caption("Data sourced from SEC EDGAR XBRL 10-K filings. "
-               "Verify against primary filings for investment decisions.")
-
-# ----------------------------------------------------------------------------
-# TAB 5 \u2014 Financial Statements
-# ----------------------------------------------------------------------------
-with tab5:
     st.subheader("Financial Statements")
     fs_airline = st.selectbox("Select Airline", airlines, key="fs_airline")
     fs_period = st.radio("Period", ["Annual", "Quarterly"], horizontal=True, key="fs_period")
     fs_ticker = data[fs_airline]["ticker"]
     n_periods = 3 if fs_period == "Annual" else 4
 
-    stmts = fetch_yf_statements(fs_ticker)
+    bundle = data[fs_airline].get("bundle", {})
+    stmts = {k: bundle.get(k, pd.DataFrame()) for k in ["fin", "bs", "cf", "qfin", "qbs", "qcf"]}
 
     inc_df = stmts["fin"] if fs_period == "Annual" else stmts["qfin"]
     bal_df = stmts["bs"] if fs_period == "Annual" else stmts["qbs"]
     cf_df = stmts["cf"] if fs_period == "Annual" else stmts["qcf"]
 
     if inc_df.empty and bal_df.empty and cf_df.empty:
-        st.error(
-            f"No financial-statement data returned from Yahoo Finance for {fs_ticker}. "
-            "This is common for delisted or recently acquired carriers, or when Yahoo "
-            "rate-limits the request. Try again shortly or pick another airline."
-        )
+        st.error(f"No financial-statement data returned from Yahoo Finance for {fs_ticker}. "
+                 "This is common for delisted or recently acquired carriers, or when Yahoo "
+                 "rate-limits the request. Try again shortly or pick another airline.")
     else:
         xlsx_bytes = build_yf_excel(fs_ticker, stmts)
         st.download_button(
@@ -1564,15 +1248,13 @@ with tab5:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="fs_download",
         )
-        st.caption(
-            "Source: Yahoo Finance (yfinance). Values in $millions (2dp) unless marked "
-            "EPS ($/share) or % (margins). Rows absent from Yahoo's data are skipped. "
-            "Excel export includes both Annual and Quarterly sheets. "
-            + ("Note: quarterly %\u0394 is period-over-period (seasonal), not year-on-year."
-               if fs_period == "Quarterly" else "")
-        )
+        st.caption("Source: Yahoo Finance (yfinance). Values in millions of the airline's local "
+                   "reporting currency (2dp) unless marked EPS or %. Rows absent from Yahoo's data "
+                   "are skipped. " + ("Quarterly %\u0394 is period-over-period (seasonal), "
+                                      "not year-on-year." if fs_period == "Quarterly" else ""))
 
-        i_labels, i_cols, i_rows = prepare_yf_statement(inc_df, INCOME_YF, fs_period, n_periods, revenue_df=inc_df)
+        i_labels, i_cols, i_rows = prepare_yf_statement(inc_df, INCOME_YF, fs_period, n_periods,
+                                                        revenue_df=inc_df)
         if i_labels:
             st.markdown(render_yf_html("Income Statement", i_labels, i_cols, i_rows, fs_period),
                         unsafe_allow_html=True)
@@ -1589,11 +1271,13 @@ with tab5:
         else:
             st.info("No balance sheet data available.")
 
-        c_labels, c_cols, c_rows = prepare_yf_statement(cf_df, CASHFLOW_YF, fs_period, n_periods, revenue_df=inc_df)
+        c_labels, c_cols, c_rows = prepare_yf_statement(cf_df, CASHFLOW_YF, fs_period, n_periods,
+                                                        revenue_df=inc_df)
         if c_labels:
             st.markdown(render_yf_html("Cash Flow Statement", c_labels, c_cols, c_rows, fs_period),
                         unsafe_allow_html=True)
         else:
             st.info("No cash flow data available.")
+
 
 # To run: streamlit run app.py
