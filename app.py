@@ -1272,9 +1272,154 @@ def _pct(x):
     return "\u2014" if x is None else f"{x * 100:.2f}%"
 
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+# ----------------------------------------------------------------------------
+# Fuel Analysis engine (EIA jet fuel + EBITDAR correlation + EDGAR sensitivity)
+# ----------------------------------------------------------------------------
+# NOTE: EIA does NOT accept "DEMO" as a key (that is data.gov's convention).
+# Register a free key at https://api.eia.gov/opendata/register and replace it,
+# or Sections 1 and 2 will always fall through to their error/empty paths.
+EIA_API_KEY = "DEMO"
+EIA_JET_FUEL_URL = (
+    "https://api.eia.gov/v2/petroleum/pri/wfr/data/"
+    f"?api_key={EIA_API_KEY}&frequency=weekly&data[0]=value"
+    "&facets[product][]=EPJ&facets[duoarea][]=R30"
+    "&sort[0][column]=period&sort[0][direction]=desc&length=200"
+)
+US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "ASE"}
+US_CARRIER_CIKS = {
+    "DAL": "0000027904", "UAL": "0000100517", "AAL": "0001549922",
+    "LUV": "0000092380", "ALK": "0000766421", "JBLU": "0001158463",
+    "ALGT": "0001362988", "ULCC": "0001836035", "SAVE": "0001418121",
+    "SNCY": "0001549802", "HA": "0000046619", "SKYW": "0000070858",
+    "ATSG": "0000894871", "MESA": "0000810332",
+}
+EDGAR_HEADERS = {"User-Agent": "Aviation Finance Dashboard contact@aviationdashboard.com"}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_eia_jet_fuel():
+    try:
+        resp = requests.get(EIA_JET_FUEL_URL, timeout=10)
+        rows = resp.json()["response"]["data"]
+        df = pd.DataFrame(rows)
+        df["period"] = pd.to_datetime(df["period"])
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["value"]).sort_values("period").reset_index(drop=True)
+        return df if not df.empty else None
+    except Exception:
+        return None
+
+
+def _filter_fuel_timeframe(df, choice):
+    if df is None or df.empty:
+        return df
+    end = df["period"].max()
+    today = pd.Timestamp.today().normalize()
+    if choice == "Year to Date":
+        start = pd.Timestamp(year=today.year, month=1, day=1)
+    elif choice == "Last Month":
+        start = end - pd.Timedelta(days=30)
+    elif choice == "Last 12 Months":
+        start = end - pd.Timedelta(days=365)
+    else:
+        start = end - pd.Timedelta(days=1095)
+    return df[df["period"] >= start]
+
+
+def _quarter_ebitdar_margins(bundle):
+    qi = bundle.get("qfin")
+    qc = bundle.get("qcf")
+    if qi is None or getattr(qi, "empty", True):
+        return pd.DataFrame()
+    oi_idx = _yf_find(qi, "Operating Income")
+    rev_idx = _yf_find(qi, "Total Revenue")
+    if oi_idx is None or rev_idx is None:
+        return pd.DataFrame()
+    da_idx = _yf_find(qc, "Depreciation And Amortization") if qc is not None else None
+    lease_idx = _yf_find(qi, "Rent Expense Supplemental")
+    rows = []
+    for c in list(qi.columns)[:4]:
+        try:
+            oi = qi.loc[oi_idx, c]
+            rev = qi.loc[rev_idx, c]
+        except Exception:
+            continue
+        if pd.isna(oi) or pd.isna(rev) or rev == 0:
+            continue
+        da = 0.0
+        if da_idx is not None and qc is not None and c in qc.columns:
+            dv = qc.loc[da_idx, c]
+            da = 0.0 if pd.isna(dv) else float(dv)
+        lease = 0.0
+        if lease_idx is not None:
+            lv = qi.loc[lease_idx, c]
+            lease = 0.0 if pd.isna(lv) else float(lv)
+        ebitdar = float(oi) + da + lease
+        rows.append({"q_end": pd.Timestamp(c),
+                     "label": _col_label(pd.Timestamp(c), "Quarterly"),
+                     "margin": ebitdar / float(rev) * 100})
+    return pd.DataFrame(rows)
+
+
+def _avg_fuel_for_quarter(df_fuel, q_end):
+    start = q_end - pd.Timedelta(days=90)
+    sub = df_fuel[(df_fuel["period"] >= start) & (df_fuel["period"] <= q_end)]
+    return sub["value"].mean() if not sub.empty else None
+
+
+def _corr(xs, ys):
+    try:
+        from scipy import stats
+        res = stats.linregress(xs, ys)
+        return float(res.rvalue), float(res.slope), float(res.intercept)
+    except Exception:
+        import numpy as np
+        if len(xs) < 2:
+            return None, None, None
+        r = float(np.corrcoef(xs, ys)[0, 1])
+        slope, intercept = (float(v) for v in np.polyfit(xs, ys, 1))
+        return r, slope, intercept
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_edgar_fuel(cik):
+    """(fuel_cost, opex) for the most recent FY from SEC EDGAR, or (None, None)."""
+    try:
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        resp = requests.get(url, headers=EDGAR_HEADERS, timeout=10)
+        facts = resp.json().get("facts", {}).get("us-gaap", {})
+    except Exception:
+        return None, None
+
+    def latest_annual(concepts):
+        for c in concepts:
+            node = facts.get(c)
+            if not node:
+                continue
+            for _unit, series in node.get("units", {}).items():
+                best = None
+                for e in series:
+                    if e.get("form") != "10-K" or e.get("fp") != "FY" or e.get("val") is None:
+                        continue
+                    if best is None or e.get("end", "") > best.get("end", ""):
+                        best = e
+                if best:
+                    return float(best["val"])
+        return None
+
+    fuel = latest_annual(["AirlineFuelCosts", "AirlineCapacityPurchaseArrangements"])
+    opex = latest_annual(["OperatingExpenses", "CostsAndExpenses"])
+    return fuel, opex
+
+
+def _is_us_carrier(ticker, info):
+    exch = info.get("exchange") or info.get("fullExchangeName") or ""
+    return exch in US_EXCHANGES or "." not in ticker
+
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Credit Summary", "Trends", "Peer Ranking", "Financial Statements",
-    "Fleet Composition", "Reverse DCF"
+    "Fleet Composition", "Reverse DCF", "Fuel Analysis"
 ])
 
 
@@ -1799,5 +1944,177 @@ with tab6:
                         "while the TTM actual (OCF + CapEx) is a levered proxy, so the gap is indicative.")
             except Exception as exc:
                 st.warning(f"Reverse DCF could not be completed for {name}: {exc}")
+
+# ----------------------------------------------------------------------------
+# TAB 7 \u2014 Fuel Analysis
+# ----------------------------------------------------------------------------
+with tab7:
+    st.subheader("Fuel Analysis")
+
+    # ---- Section 1: EIA jet fuel price chart ----
+    st.markdown("#### 1 \u00b7 Jet Fuel Price")
+    df_fuel = fetch_eia_jet_fuel()
+    if df_fuel is None:
+        st.error("Could not load EIA jet fuel price data. Check your connection and try again.")
+    else:
+        choice = st.selectbox("Timeframe",
+                              ["Year to Date", "Last Month", "Last 12 Months", "Last 3 Years"],
+                              index=2, key="fuel_tf")
+        fdf = _filter_fuel_timeframe(df_fuel, choice).copy()
+        if fdf.empty:
+            st.info("No jet fuel data in the selected timeframe.")
+        else:
+            fdf["ma4"] = fdf["value"].rolling(4, min_periods=1).mean()
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=fdf["period"], y=fdf["value"], mode="lines",
+                                     name="Weekly", line=dict(color="#2563eb")))
+            fig.add_trace(go.Scatter(x=fdf["period"], y=fdf["ma4"], mode="lines",
+                                     name="4-week avg", line=dict(color="#93c5fd", width=2)))
+            fig.update_layout(title="U.S. Jet Fuel Price (Gulf Coast, $/gallon)", height=380,
+                              margin=dict(l=10, r=10, t=40, b=10), yaxis_title="$/gallon")
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Source: U.S. Energy Information Administration (EIA). "
+                       "Weekly spot price, U.S. Gulf Coast.")
+
+    st.divider()
+
+    # ---- Section 2: fuel vs EBITDAR margin correlation ----
+    st.markdown("#### 2 \u00b7 Fuel Price vs EBITDAR Margin")
+    st.info("Correlation is calculated on the last 4 available quarters of data \u2014 the maximum "
+            "reliably available from yfinance quarterly financials. Minimum 4 quarters required. "
+            "Correlation is always calculated on trailing quarters regardless of the fuel chart "
+            "timeframe selected above. With only 4 points the coefficient is directional, not "
+            "statistically robust.")
+    if df_fuel is None:
+        st.warning("Fuel price data is unavailable, so fuel-vs-margin correlation cannot be computed.")
+    else:
+        for name in airlines:
+            bundle = data[name].get("bundle", {})
+            qm = _quarter_ebitdar_margins(bundle)
+            xs, ys, labels = [], [], []
+            if not qm.empty:
+                for _, r in qm.iterrows():
+                    fp = _avg_fuel_for_quarter(df_fuel, r["q_end"])
+                    if fp is not None and pd.notna(fp) and pd.notna(r["margin"]):
+                        xs.append(float(fp)); ys.append(float(r["margin"])); labels.append(r["label"])
+            if len(xs) < 4:
+                st.warning(f"Insufficient quarterly data for {name} to calculate fuel correlation. "
+                           "Minimum 4 quarters required.")
+                continue
+            r_val, slope, intercept = _corr(xs, ys)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=xs, y=ys, mode="markers+text", text=labels,
+                                     textposition="top center", name="Quarters",
+                                     marker=dict(size=11, color="#2563eb")))
+            if slope is not None:
+                lo, hi = min(xs), max(xs)
+                fig.add_trace(go.Scatter(x=[lo, hi], y=[slope * lo + intercept, slope * hi + intercept],
+                                         mode="lines", name="Trend", line=dict(color="#9ca3af", dash="dash")))
+            fig.update_layout(title=f"{name} \u2014 Jet Fuel Price vs EBITDAR Margin (Last 4 Quarters)",
+                              height=360, margin=dict(l=10, r=10, t=40, b=10),
+                              xaxis_title="Avg quarterly fuel price ($/gal)", yaxis_title="EBITDAR margin (%)")
+            st.plotly_chart(fig, use_container_width=True)
+            if r_val is None:
+                st.caption("Correlation could not be computed.")
+            else:
+                if r_val < -0.5:
+                    col = GREEN_TEXT
+                elif r_val <= -0.2:
+                    col = AMBER_TEXT
+                else:
+                    col = RED_TEXT
+                st.markdown(f"<span style='color:{col};font-weight:700;'>Correlation coefficient: "
+                            f"{r_val:.2f}</span>", unsafe_allow_html=True)
+            st.caption("A negative correlation indicates EBITDAR margin compresses as fuel prices "
+                       "rise, as expected. Weak or positive correlation may indicate effective "
+                       "hedging, fuel surcharge pass-through, or insufficient data.")
+
+    st.divider()
+
+    # ---- Section 3: fuel price sensitivity (U.S. carriers only) ----
+    st.markdown("#### 3 \u00b7 Fuel Price Sensitivity")
+    st.warning("Fuel sensitivity analysis is available for U.S. carriers only. This feature "
+               "requires airline-specific fuel cost data from SEC EDGAR (XBRL tag: AirlineFuelCosts), "
+               "which is only available for U.S.-listed carriers filing with the SEC. International "
+               "airlines loaded in this session will not appear in this section.")
+
+    us_names = [n for n in airlines
+                if _is_us_carrier(data[n]["ticker"], data[n].get("bundle", {}).get("info") or {})]
+    if not us_names:
+        st.info("No U.S.-listed carriers loaded.")
+
+    for name in us_names:
+        ticker = data[name]["ticker"]
+        st.markdown(f"**{name} ({ticker})**")
+        cik = US_CARRIER_CIKS.get(ticker)
+        if not cik:
+            st.info(f"Fuel cost data not available in SEC EDGAR for {name}.")
+            continue
+        try:
+            fuel_cost, opex = fetch_edgar_fuel(cik)
+        except Exception:
+            fuel_cost, opex = None, None
+        if fuel_cost is None:
+            st.info(f"Fuel cost data not available in SEC EDGAR for {name}.")
+            continue
+
+        rec = data[name]["records"][-1] if data[name]["records"] else None
+        bundle = data[name].get("bundle", {})
+        M = extract_yf_financials(bundle)
+        fy = rec["fy"] if rec else None
+        revenue = rec["revenue"] if rec else None
+        interest = rec["interest_expense"] if rec else None
+        ebitda = rec["ebitda"] if rec else None
+        ebitdar = rec["ebitdar"] if rec else None
+        oi = M.get("operating_income", {}).get(fy) if fy is not None else None
+        if None in (revenue, ebitdar, oi) or revenue == 0:
+            st.info(f"Baseline income data incomplete for {name} \u2014 sensitivity unavailable.")
+            continue
+
+        fuel_pct = (fuel_cost / opex * 100) if (opex and opex > 0) else None
+        inc = st.slider(f"Fuel Price Increase \u2014 {name}", min_value=0, max_value=100,
+                        value=10, step=5, format="+%d%%", key=f"fuel_sensitivity_{ticker}")
+
+        impact = fuel_cost * inc / 100.0
+        new_oi = oi - impact
+        new_ebitdar = ebitdar - impact           # lease add-back unchanged by fuel
+        base_margin = ebitdar / revenue * 100
+        new_margin = new_ebitdar / revenue * 100
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Fuel Cost Impact", _money(impact),
+                  help=(f"Fuel = {fuel_pct:.1f}% of operating expenses" if fuel_pct is not None else None))
+        pct_change = (-impact / ebitdar * 100) if ebitdar else 0.0
+        c2.metric("EBITDAR Change", _money(-impact), delta=f"{pct_change:.1f}%")
+        c3.metric("New EBITDAR Margin", f"{new_margin:.1f}%",
+                  help=f"Baseline {base_margin:.1f}%")
+
+        if interest and interest > 0:
+            cov_ic = absolute_rag(7, new_oi / interest)
+            cov_er = absolute_rag(8, new_ebitdar / interest)
+            order = {"red": 3, "amber": 2, "green": 1, None: 0}
+            worst = max((cov_ic, cov_er), key=lambda c: order.get(c, 0))
+            if worst == "green":
+                c4.markdown(f"<div style='color:{GREEN_TEXT};font-weight:700;padding-top:12px;'>"
+                            "\u2713 Covenants Clear</div>", unsafe_allow_html=True)
+            elif worst == "amber":
+                c4.markdown(f"<div style='color:{AMBER_TEXT};font-weight:700;padding-top:12px;'>"
+                            "\u26a0 Approaching Threshold</div>", unsafe_allow_html=True)
+            else:
+                c4.markdown(f"<div style='color:{RED_TEXT};font-weight:700;padding-top:12px;'>"
+                            "\u2717 Covenant Breach Risk</div>", unsafe_allow_html=True)
+        else:
+            c4.markdown("<div style='color:#6b7280;padding-top:12px;'>Coverage N/A</div>",
+                        unsafe_allow_html=True)
+
+        fig = go.Figure(go.Bar(x=["Baseline", f"+{inc}% fuel"], y=[base_margin, new_margin],
+                               marker_color=["#2563eb", "#b91c1c"]))
+        fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10),
+                          yaxis_title="EBITDAR margin (%)")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Sensitivity based on most recent fiscal year fuel cost from SEC EDGAR. Assumes "
+                   "fuel cost increase flows directly to operating expenses with no revenue offset "
+                   "(pass-through, hedging, or demand elasticity effects not modeled). "
+                   "Conservative estimate.")
 
 # To run: streamlit run app.py
