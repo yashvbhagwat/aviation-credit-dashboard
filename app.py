@@ -1275,13 +1275,14 @@ def _pct(x):
 # ----------------------------------------------------------------------------
 # Fuel Analysis engine (EIA jet fuel + EBITDAR correlation + EDGAR sensitivity)
 # ----------------------------------------------------------------------------
-# NOTE: EIA does NOT accept "DEMO" as a key (that is data.gov's convention).
-# Register a free key at https://api.eia.gov/opendata/register and replace it,
-# or Sections 1 and 2 will always fall through to their error/empty paths.
-EIA_API_KEY = "DEMO"
-EIA_JET_FUEL_URL = (
+# NOTE: The EIA API key is read from Streamlit secrets (st.secrets["EIA_API_KEY"]).
+# Set it in .streamlit/secrets.toml (or the app's Secrets settings) as:
+#     EIA_API_KEY = "your_key"
+# Register a free key at https://api.eia.gov/opendata/register. If the secret is
+# missing, Section 1/2 degrade to the "could not load" path (the app still runs).
+EIA_JET_FUEL_URL_TEMPLATE = (
     "https://api.eia.gov/v2/petroleum/pri/wfr/data/"
-    f"?api_key={EIA_API_KEY}&frequency=weekly&data[0]=value"
+    "?api_key={key}&frequency=weekly&data[0]=value"
     "&facets[product][]=EPJ&facets[duoarea][]=R30"
     "&sort[0][column]=period&sort[0][direction]=desc&length=200"
 )
@@ -1299,7 +1300,11 @@ EDGAR_HEADERS = {"User-Agent": "Aviation Finance Dashboard contact@aviationdashb
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_eia_jet_fuel():
     try:
-        resp = requests.get(EIA_JET_FUEL_URL, timeout=10)
+        eia_key = st.secrets["EIA_API_KEY"]
+    except Exception:
+        return None
+    try:
+        resp = requests.get(EIA_JET_FUEL_URL_TEMPLATE.format(key=eia_key), timeout=10)
         rows = resp.json()["response"]["data"]
         df = pd.DataFrame(rows)
         df["period"] = pd.to_datetime(df["period"])
