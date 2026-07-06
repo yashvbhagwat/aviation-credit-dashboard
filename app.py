@@ -1290,7 +1290,7 @@ US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "ASE"}
 US_CARRIER_CIKS = {
     "DAL": "0000027904", "UAL": "0000100517", "AAL": "0001549922",
     "LUV": "0000092380", "ALK": "0000766421", "JBLU": "0001158463",
-    "ALGT": "0001362988", "ULCC": "0001836035", "SAVE": "0001418121",
+    "ALGT": "0001362988", "ULCC": "0001670076", "SAVE": "0001418121",
     "SNCY": "0001549802", "HA": "0000046619", "SKYW": "0000070858",
     "ATSG": "0000894871", "MESA": "0000810332",
 }
@@ -1304,6 +1304,7 @@ def fetch_eia_jet_fuel():
     except Exception:
         return None
     try:
+        st.write(f"DEBUG EIA URL: {EIA_JET_FUEL_URL_TEMPLATE.format(key=eia_key)[:100]}...")
         resp = requests.get(EIA_JET_FUEL_URL_TEMPLATE.format(key=eia_key), timeout=10)
         rows = resp.json()["response"]["data"]
         df = pd.DataFrame(rows)
@@ -1311,7 +1312,10 @@ def fetch_eia_jet_fuel():
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
         df = df.dropna(subset=["value"]).sort_values("period").reset_index(drop=True)
         return df if not df.empty else None
-    except Exception:
+    except Exception as e:
+        import traceback
+        st.write(f"DEBUG EIA ERROR: {type(e).__name__}: {e}")
+        st.write(traceback.format_exc())
         return None
 
 
@@ -1412,8 +1416,15 @@ def fetch_edgar_fuel(cik):
                     return float(best["val"])
         return None
 
-    fuel = latest_annual(["AirlineFuelCosts", "AirlineCapacityPurchaseArrangements"])
-    opex = latest_annual(["OperatingExpenses", "CostsAndExpenses"])
+    fuel = latest_annual(["AirlineFuelCosts",
+                          "FuelCosts",
+                          "FuelCostsAndTaxes",
+                          "AircraftFuelAndRelatedTaxes",
+                          "AirlineCapacityPurchaseArrangements"])
+    opex = latest_annual(["OperatingExpenses",
+                          "CostsAndExpenses",
+                          "OperatingCostsAndExpenses",
+                          "CostsAndExpensesTotal"])
     return fuel, opex
 
 
