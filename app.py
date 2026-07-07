@@ -1307,6 +1307,7 @@ def fetch_eia_jet_fuel():
         st.write(f"DEBUG EIA URL: {EIA_JET_FUEL_URL_TEMPLATE.format(key=eia_key)[:100]}...")
         resp = requests.get(EIA_JET_FUEL_URL_TEMPLATE.format(key=eia_key), timeout=10)
         rows = resp.json()["response"]["data"]
+        st.write(f"DEBUG EIA RAW: {rows[0] if rows else 'empty'}")
         df = pd.DataFrame(rows)
         df["period"] = pd.to_datetime(df["period"])
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
