@@ -1273,19 +1273,10 @@ def _pct(x):
 
 
 # ----------------------------------------------------------------------------
-# Fuel Analysis engine (EIA jet fuel + EBITDAR correlation + EDGAR sensitivity)
+# Fuel Analysis engine (WTI crude proxy + EBITDAR correlation + EDGAR sensitivity)
 # ----------------------------------------------------------------------------
-# NOTE: The EIA API key is read from Streamlit secrets (st.secrets["EIA_API_KEY"]).
-# Set it in .streamlit/secrets.toml (or the app's Secrets settings) as:
-#     EIA_API_KEY = "your_key"
-# Register a free key at https://api.eia.gov/opendata/register. If the secret is
-# missing, Section 1/2 degrade to the "could not load" path (the app still runs).
-EIA_JET_FUEL_URL_TEMPLATE = (
-    "https://api.eia.gov/v2/petroleum/pri/wfr/data/"
-    "?api_key={key}&frequency=weekly&data[0]=value"
-    "&facets[product][]=EPJ&facets[duoarea][]=R30"
-    "&sort[0][column]=period&sort[0][direction]=desc&length=200"
-)
+# Crude oil (WTI, CL=F) via yfinance is used as a proxy for jet fuel price trends.
+# No external API key is required.
 US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "ASE"}
 US_CARRIER_CIKS = {
     "DAL": "0000027904", "UAL": "0000100517", "AAL": "0001549922",
@@ -1298,25 +1289,19 @@ EDGAR_HEADERS = {"User-Agent": "Aviation Finance Dashboard contact@aviationdashb
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_eia_jet_fuel():
+def fetch_crude_oil_prices():
     try:
-        eia_key = st.secrets["EIA_API_KEY"]
-    except Exception:
-        return None
-    try:
-        st.write(f"DEBUG EIA URL: {EIA_JET_FUEL_URL_TEMPLATE.format(key=eia_key)[:100]}...")
-        resp = requests.get(EIA_JET_FUEL_URL_TEMPLATE.format(key=eia_key), timeout=10)
-        rows = resp.json()["response"]["data"]
-        st.write(f"DEBUG EIA RAW: {rows[0] if rows else 'empty'}")
-        df = pd.DataFrame(rows)
+        df = yf.download("CL=F", period="3y", interval="1wk",
+                         progress=False, auto_adjust=True)
+        if df.empty:
+            return None
+        df = df[["Close"]].reset_index()
+        df.columns = ["period", "value"]
         df["period"] = pd.to_datetime(df["period"])
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        df = df.dropna(subset=["value"]).sort_values("period").reset_index(drop=True)
+        df = df.dropna().sort_values("period").reset_index(drop=True)
         return df if not df.empty else None
-    except Exception as e:
-        import traceback
-        st.write(f"DEBUG EIA ERROR: {type(e).__name__}: {e}")
-        st.write(traceback.format_exc())
+    except Exception:
         return None
 
 
@@ -1968,18 +1953,19 @@ with tab6:
 with tab7:
     st.subheader("Fuel Analysis")
 
-    # ---- Section 1: EIA jet fuel price chart ----
-    st.markdown("#### 1 \u00b7 Jet Fuel Price")
-    df_fuel = fetch_eia_jet_fuel()
+    # ---- Section 1: crude oil price chart (jet fuel proxy) ----
+    st.markdown("#### 1 \u00b7 Crude Oil Price (Jet Fuel Proxy)")
+    df_fuel = fetch_crude_oil_prices()
     if df_fuel is None:
-        st.error("Could not load EIA jet fuel price data. Check your connection and try again.")
+        st.error("Could not load crude oil price data from Yahoo Finance. "
+                 "Check your connection and try again.")
     else:
         choice = st.selectbox("Timeframe",
                               ["Year to Date", "Last Month", "Last 12 Months", "Last 3 Years"],
                               index=2, key="fuel_tf")
         fdf = _filter_fuel_timeframe(df_fuel, choice).copy()
         if fdf.empty:
-            st.info("No jet fuel data in the selected timeframe.")
+            st.info("No crude oil data in the selected timeframe.")
         else:
             fdf["ma4"] = fdf["value"].rolling(4, min_periods=1).mean()
             fig = go.Figure()
@@ -1987,11 +1973,13 @@ with tab7:
                                      name="Weekly", line=dict(color="#2563eb")))
             fig.add_trace(go.Scatter(x=fdf["period"], y=fdf["ma4"], mode="lines",
                                      name="4-week avg", line=dict(color="#93c5fd", width=2)))
-            fig.update_layout(title="U.S. Jet Fuel Price (Gulf Coast, $/gallon)", height=380,
-                              margin=dict(l=10, r=10, t=40, b=10), yaxis_title="$/gallon")
+            fig.update_layout(title="Crude Oil Price \u2014 WTI ($/barrel)", height=380,
+                              margin=dict(l=10, r=10, t=40, b=10), yaxis_title="$/barrel")
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("Source: U.S. Energy Information Administration (EIA). "
-                       "Weekly spot price, U.S. Gulf Coast.")
+            st.caption("Source: Yahoo Finance (WTI crude oil futures, CL=F). Used as a proxy "
+                       "for jet fuel price trends. Jet fuel trades at a variable spread to crude "
+                       "oil \u2014 directional correlation is valid but absolute price levels differ. "
+                       "For precise jet fuel prices, refer to the IATA Jet Fuel Monitor.")
 
     st.divider()
 
@@ -2029,7 +2017,7 @@ with tab7:
                                          mode="lines", name="Trend", line=dict(color="#9ca3af", dash="dash")))
             fig.update_layout(title=f"{name} \u2014 Jet Fuel Price vs EBITDAR Margin (Last 4 Quarters)",
                               height=360, margin=dict(l=10, r=10, t=40, b=10),
-                              xaxis_title="Avg quarterly fuel price ($/gal)", yaxis_title="EBITDAR margin (%)")
+                              xaxis_title="Avg quarterly crude price ($/bbl)", yaxis_title="EBITDAR margin (%)")
             st.plotly_chart(fig, use_container_width=True)
             if r_val is None:
                 st.caption("Correlation could not be computed.")
